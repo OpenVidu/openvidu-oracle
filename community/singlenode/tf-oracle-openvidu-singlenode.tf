@@ -1,0 +1,879 @@
+# Get Availability Domain
+data "oci_identity_availability_domain" "ad" {
+  compartment_id = var.tenancy_ocid
+  ad_number      = var.availability_domain
+}
+
+# ---------------------------- SSH Key -------------------------
+
+resource "tls_private_key" "openvidu_ssh_key" {
+  algorithm = "ED25519"
+}
+
+# ------------------------- Networking -------------------------
+
+# VCN
+resource "oci_core_vcn" "openvidu_vcn" {
+  cidr_block     = "10.0.0.0/16"
+  compartment_id = var.compartment_ocid
+  display_name   = "${var.stackName}-vcn"
+}
+
+## This is needed to make the VM reachable from the internet. It will be used in the route table to allow outbound traffic to the internet and in the security list to allow inbound traffic on necessary ports.
+##-------------------------------------------------
+# Internet Gateway
+resource "oci_core_internet_gateway" "openvidu_igw" {
+  compartment_id = var.compartment_ocid
+  display_name   = "${var.stackName}-igw"
+  vcn_id         = oci_core_vcn.openvidu_vcn.id
+  enabled        = true
+}
+
+# Route Table
+resource "oci_core_route_table" "openvidu_rt" {
+  compartment_id = var.compartment_ocid
+  vcn_id         = oci_core_vcn.openvidu_vcn.id
+  display_name   = "${var.stackName}-rt"
+
+  route_rules {
+    destination       = "0.0.0.0/0"
+    destination_type  = "CIDR_BLOCK"
+    network_entity_id = oci_core_internet_gateway.openvidu_igw.id
+  }
+}
+
+# Subnet
+resource "oci_core_subnet" "openvidu_subnet" {
+  cidr_block        = "10.0.1.0/24"
+  compartment_id    = var.compartment_ocid
+  vcn_id            = oci_core_vcn.openvidu_vcn.id
+  display_name      = "${var.stackName}-subnet"
+  dns_label         = "openvidusubnet"
+  route_table_id    = oci_core_route_table.openvidu_rt.id
+  security_list_ids         = []
+  prohibit_public_ip_on_vnic = false
+}
+##-------------------------------------------------
+
+# Network Security Group
+resource "oci_core_network_security_group" "openvidu_nsg" {
+  compartment_id = var.compartment_ocid
+  vcn_id         = oci_core_vcn.openvidu_vcn.id
+  display_name   = "${var.stackName}-nsg"
+}
+
+# NSG Egress Rules
+resource "oci_core_network_security_group_security_rule" "openvidu_nsg_egress" {
+  network_security_group_id = oci_core_network_security_group.openvidu_nsg.id
+  direction                 = "EGRESS"
+  destination               = "0.0.0.0/0"
+  protocol                  = "all"
+}
+
+# NSG Ingress Rules
+resource "oci_core_network_security_group_security_rule" "openvidu_nsg_ingress_ssh" {
+  network_security_group_id = oci_core_network_security_group.openvidu_nsg.id
+  direction                 = "INGRESS"
+  protocol                  = "6" #TCP
+  source                    = "0.0.0.0/0"
+  tcp_options {
+    destination_port_range {
+      min = 22
+      max = 22
+    }
+  }
+  description = "SSH"
+}
+
+resource "oci_core_network_security_group_security_rule" "openvidu_nsg_ingress_http" {
+  network_security_group_id = oci_core_network_security_group.openvidu_nsg.id
+  direction                 = "INGRESS"
+  protocol                  = "6" #TCP
+  source                    = "0.0.0.0/0"
+  tcp_options {
+    destination_port_range {
+      min = 80
+      max = 80
+    }
+  }
+  description = "HTTP"
+}
+
+resource "oci_core_network_security_group_security_rule" "openvidu_nsg_ingress_https" {
+  network_security_group_id = oci_core_network_security_group.openvidu_nsg.id
+  direction                 = "INGRESS"
+  protocol                  = "6" #TCP
+  source                    = "0.0.0.0/0"
+  tcp_options {
+    destination_port_range {
+      min = 443
+      max = 443
+    }
+  }
+  description = "HTTPS"
+}
+
+resource "oci_core_network_security_group_security_rule" "openvidu_nsg_ingress_turn_udp" {
+  network_security_group_id = oci_core_network_security_group.openvidu_nsg.id
+  direction                 = "INGRESS"
+  protocol                  = "17" #UDP
+  source                    = "0.0.0.0/0"
+  udp_options {
+    destination_port_range {
+      min = 443
+      max = 443
+    }
+  }
+  description = "TURN UDP 443"
+}
+
+resource "oci_core_network_security_group_security_rule" "openvidu_nsg_ingress_rtmp" {
+  network_security_group_id = oci_core_network_security_group.openvidu_nsg.id
+  direction                 = "INGRESS"
+  protocol                  = "6" #TCP
+  source                    = "0.0.0.0/0"
+  tcp_options {
+    destination_port_range {
+      min = 1935
+      max = 1935
+    }
+  }
+  description = "RTMP"
+}
+
+resource "oci_core_network_security_group_security_rule" "openvidu_nsg_ingress_livekit_tcp" {
+  network_security_group_id = oci_core_network_security_group.openvidu_nsg.id
+  direction                 = "INGRESS"
+  protocol                  = "6" #TCP
+  source                    = "0.0.0.0/0"
+  tcp_options {
+    destination_port_range {
+      min = 7881
+      max = 7881
+    }
+  }
+  description = "LiveKit/WebRTC TCP"
+}
+
+resource "oci_core_network_security_group_security_rule" "openvidu_nsg_ingress_livekit_udp" {
+  network_security_group_id = oci_core_network_security_group.openvidu_nsg.id
+  direction                 = "INGRESS"
+  protocol                  = "17" #UDP
+  source                    = "0.0.0.0/0"
+  udp_options {
+    destination_port_range {
+      min = 7885
+      max = 7885
+    }
+  }
+  description = "LiveKit/WebRTC UDP"
+}
+
+resource "oci_core_network_security_group_security_rule" "openvidu_nsg_ingress_minio_tcp" {
+  network_security_group_id = oci_core_network_security_group.openvidu_nsg.id
+  direction                 = "INGRESS"
+  protocol                  = "6" #TCP
+  source                    = "0.0.0.0/0"
+  tcp_options {
+    destination_port_range {
+      min = 9000
+      max = 9000
+    }
+  }
+  description = "MinIO"
+}
+
+resource "oci_core_network_security_group_security_rule" "openvidu_nsg_ingress_webrtc_udp" {
+  network_security_group_id = oci_core_network_security_group.openvidu_nsg.id
+  direction                 = "INGRESS"
+  protocol                  = "17" #UDP
+  source                    = "0.0.0.0/0"
+  udp_options {
+    destination_port_range {
+      min = 50000
+      max = 60000
+    }
+  }
+  description = "WebRTC UDP Range"
+}
+# ------------------------- Object Storage -------------------------
+
+locals {
+  # Only create bucket if S3 credentials are provided AND no existing bucket name
+  isEmptyBucketName = var.bucketName == ""
+}
+
+data "oci_objectstorage_namespace" "ns" {
+  compartment_id = var.tenancy_ocid
+}
+
+# Create credentials in deployment time
+
+
+# Object Storage Bucket
+resource "oci_objectstorage_bucket" "openvidu_bucket" {
+  count          = local.isEmptyBucketName ? 1 : 0
+  compartment_id = var.compartment_ocid
+  namespace      = data.oci_objectstorage_namespace.ns.namespace
+  name           = "openvidu-appdata"
+  storage_tier   = "Standard"
+}
+
+# ------------------------- Compute Instance -------------------------
+
+## Image Selection
+#-------------------------------------------------
+locals {
+  is_arm   = can(regex("A1", var.instanceType))
+  image_id = local.is_arm ? data.oci_core_images.ubuntu_arm.images[0].id : data.oci_core_images.ubuntu_x86.images[0].id
+}
+
+data "oci_core_images" "ubuntu_x86" {
+  compartment_id           = var.compartment_ocid
+  operating_system         = "Canonical Ubuntu"
+  operating_system_version = "24.04"
+
+  shape = var.instanceType
+
+  filter {
+    name   = "display_name"
+    values = [".*x86_64.*"]
+    regex  = true
+  }
+}
+
+data "oci_core_images" "ubuntu_arm" {
+  compartment_id           = var.compartment_ocid
+  operating_system         = "Canonical Ubuntu"
+  operating_system_version = "24.04"
+
+  shape = var.instanceType
+
+  filter {
+    name   = "display_name"
+    values = [".*aarch64.*"]
+    regex  = true
+  }
+}
+#-------------------------------------------------
+
+# Compute Instance
+resource "oci_core_instance" "openvidu_server" {
+  availability_domain = data.oci_identity_availability_domain.ad.name
+  compartment_id      = var.compartment_ocid
+  display_name        = "${var.stackName}-vm-ce"
+  shape               = var.instanceType
+
+  dynamic "shape_config" {
+    for_each = length(regexall("Flex", var.instanceType)) > 0 ? [1] : []
+    content {
+      ocpus         = var.instanceOCPUs
+      memory_in_gbs = var.instanceMemory
+    }
+  }
+
+  source_details {
+    source_type = "image"
+    source_id   = local.image_id
+  }
+
+  create_vnic_details {
+    subnet_id        = oci_core_subnet.openvidu_subnet.id
+    display_name     = "${var.stackName}-vnic"
+    assign_public_ip = true
+  }
+
+  metadata = {
+    ssh_authorized_keys = tls_private_key.openvidu_ssh_key.public_key_openssh
+    user_data           = base64encode(local.user_data)
+  }
+
+  freeform_tags = {
+    "stack" = var.stackName
+  }
+}
+
+# --------------------- Vault for secrets management --------------------
+
+resource "oci_kms_vault" "openvidu_vault" {
+  compartment_id = var.compartment_ocid
+  display_name   = "${var.stackName}-vault"
+  vault_type     = "DEFAULT"
+}
+
+resource "oci_kms_key" "openvidu_key" {
+  compartment_id      = var.compartment_ocid
+  display_name        = "${var.stackName}-key"
+  management_endpoint = oci_kms_vault.openvidu_vault.management_endpoint
+
+  key_shape {
+    algorithm = "AES"
+    length    = 32
+  }
+}
+
+
+# ------------------------- locals with scripts -------------------------
+
+locals {
+  bucket_name      = local.isEmptyBucketName ? oci_objectstorage_bucket.openvidu_bucket[0].name : var.bucketName
+  bucket_namespace = data.oci_objectstorage_namespace.ns.namespace
+
+  install_script = <<-EOF
+#!/bin/bash -x
+set -e
+
+OPENVIDU_VERSION=main
+DOMAIN=
+
+echo "DPkg::Lock::Timeout \"-1\";" > /etc/apt/apt.conf.d/99timeout
+# Install dependencies
+apt-get update && apt-get install -y \
+  curl \
+  unzip \
+  jq \
+  wget \
+  ca-certificates \
+  gnupg \
+  lsb-release \
+  openssl
+
+# Create counter file for tracking script executions
+echo 1 > /usr/local/bin/openvidu_install_counter.txt
+
+# Get Public IP from OCI metadata
+get_public_ip() {
+  local ip
+  ip=$(dig +short myip.opendns.com @resolver1.opendns.com 2>/dev/null) \
+    || ip=$(dig +short txt ch whoami.cloudflare @1.1.1.1 2>/dev/null | tr -d '"') \
+    || ip=$(dig +short txt o-o.myaddr.l.google.com @ns1.google.com 2>/dev/null | tr -d '"')
+
+  if [[ -z "$ip" ]]; then
+    echo "Error: Could not determine public IP" >&2
+    return 1
+  fi
+  echo "$ip"
+}
+PUBLIC_IP=$(get_public_ip)
+
+# Determine Domain
+if [[ "${var.domainName}" == "" ]]; then
+  [ ! -d "/usr/share/openvidu" ] && mkdir -p /usr/share/openvidu
+  RANDOM_DOMAIN_STRING=$(tr -dc 'a-z' < /dev/urandom | head -c 8)
+  DOMAIN="openvidu-$RANDOM_DOMAIN_STRING-$(echo $PUBLIC_IP | tr '.' '-').sslip.io"
+else
+  DOMAIN="${var.domainName}"
+fi
+DOMAIN="$(/usr/local/bin/store_secret.sh save DOMAIN_NAME "$DOMAIN")"
+
+# Meet initial admin user and password
+MEET_INITIAL_ADMIN_USER="$(/usr/local/bin/store_secret.sh save MEET_INITIAL_ADMIN_USER "admin")"
+if [[ "${var.initialMeetAdminPassword}" != '' ]]; then
+  MEET_INITIAL_ADMIN_PASSWORD="$(/usr/local/bin/store_secret.sh save MEET_INITIAL_ADMIN_PASSWORD "${var.initialMeetAdminPassword}")"
+else
+  MEET_INITIAL_ADMIN_PASSWORD="$(/usr/local/bin/store_secret.sh generate MEET_INITIAL_ADMIN_PASSWORD)"
+fi
+
+if [[ "${var.initialMeetApiKey}" != '' ]]; then
+  MEET_INITIAL_API_KEY="$(/usr/local/bin/store_secret.sh save MEET_INITIAL_API_KEY "${var.initialMeetApiKey}")"
+fi
+
+# Store usernames and generate random passwords
+REDIS_PASSWORD="$(/usr/local/bin/store_secret.sh generate REDIS_PASSWORD)"
+MONGO_ADMIN_USERNAME="$(/usr/local/bin/store_secret.sh save MONGO_ADMIN_USERNAME "mongoadmin")"
+MONGO_ADMIN_PASSWORD="$(/usr/local/bin/store_secret.sh generate MONGO_ADMIN_PASSWORD)"
+MONGO_REPLICA_SET_KEY="$(/usr/local/bin/store_secret.sh generate MONGO_REPLICA_SET_KEY)"
+MINIO_ACCESS_KEY="$(/usr/local/bin/store_secret.sh save MINIO_ACCESS_KEY "minioadmin")"
+MINIO_SECRET_KEY="$(/usr/local/bin/store_secret.sh generate MINIO_SECRET_KEY)"
+DASHBOARD_ADMIN_USERNAME="$(/usr/local/bin/store_secret.sh save DASHBOARD_ADMIN_USERNAME "dashboardadmin")"
+DASHBOARD_ADMIN_PASSWORD="$(/usr/local/bin/store_secret.sh generate DASHBOARD_ADMIN_PASSWORD)"
+GRAFANA_ADMIN_USERNAME="$(/usr/local/bin/store_secret.sh save GRAFANA_ADMIN_USERNAME "grafanaadmin")"
+GRAFANA_ADMIN_PASSWORD="$(/usr/local/bin/store_secret.sh generate GRAFANA_ADMIN_PASSWORD)"
+ENABLED_MODULES="$(/usr/local/bin/store_secret.sh save ENABLED_MODULES "observability,openviduMeet")"
+LIVEKIT_API_KEY="$(/usr/local/bin/store_secret.sh generate LIVEKIT_API_KEY "API" 12)"
+LIVEKIT_API_SECRET="$(/usr/local/bin/store_secret.sh generate LIVEKIT_API_SECRET)"
+
+# Build install command
+INSTALL_COMMAND="sh <(curl -fsSL http://get.openvidu.io/community/singlenode/$OPENVIDU_VERSION/install.sh)"
+
+# Common arguments
+COMMON_ARGS=(
+  "--no-tty"
+  "--install"
+  "--environment=on_premise"
+  "--deployment-type=single_node"
+  "--domain-name=$DOMAIN"
+  "--enabled-modules='$ENABLED_MODULES'"
+  "--redis-password=$REDIS_PASSWORD"
+  "--mongo-admin-user=$MONGO_ADMIN_USERNAME"
+  "--mongo-admin-password=$MONGO_ADMIN_PASSWORD"
+  "--mongo-replica-set-key=$MONGO_REPLICA_SET_KEY"
+  "--minio-access-key=$MINIO_ACCESS_KEY"
+  "--minio-secret-key=$MINIO_SECRET_KEY"
+  "--dashboard-admin-user=$DASHBOARD_ADMIN_USERNAME"
+  "--dashboard-admin-password=$DASHBOARD_ADMIN_PASSWORD"
+  "--grafana-admin-user=$GRAFANA_ADMIN_USERNAME"
+  "--grafana-admin-password=$GRAFANA_ADMIN_PASSWORD"
+  "--meet-initial-admin-password=$MEET_INITIAL_ADMIN_PASSWORD"
+  "--meet-initial-api-key=$MEET_INITIAL_API_KEY"
+  "--livekit-api-key=$LIVEKIT_API_KEY"
+  "--livekit-api-secret=$LIVEKIT_API_SECRET"
+)
+
+# Include additional installer flags provided by the user
+if [[ "${var.additionalInstallFlags}" != "" ]]; then
+  IFS=',' read -ra EXTRA_FLAGS <<< "${var.additionalInstallFlags}"
+  for extra_flag in "$${EXTRA_FLAGS[@]}"; do
+    # Trim whitespace around each flag
+    extra_flag="$(echo -e "$${extra_flag}" | sed -e 's/^[ \t]*//' -e 's/[ \t]*$//')"
+    if [[ "$extra_flag" != "" ]]; then
+      COMMON_ARGS+=("$extra_flag")
+    fi
+  done
+fi
+
+# Certificate arguments
+if [[ "${var.certificateType}" == "selfsigned" ]]; then
+  CERT_ARGS=(
+    "--certificate-type=selfsigned"
+  )
+elif [[ "${var.certificateType}" == "letsencrypt" ]]; then
+  CERT_ARGS=(
+    "--certificate-type=letsencrypt"
+  )
+else
+  # Use base64 encoded certificates directly
+  OWN_CERT_CRT=${var.ownPublicCertificate}
+  OWN_CERT_KEY=${var.ownPrivateCertificate}
+  CERT_ARGS=(
+    "--certificate-type=owncert"
+    "--owncert-public-key=$OWN_CERT_CRT"
+    "--owncert-private-key=$OWN_CERT_KEY"
+  )
+fi
+
+# Final command
+FINAL_COMMAND="$INSTALL_COMMAND $(printf "%s " "$${COMMON_ARGS[@]}") $(printf "%s " "$${CERT_ARGS[@]}")"
+
+# Execute installation
+exec bash -c "$FINAL_COMMAND"
+EOF
+
+  config_s3_script = <<-EOF
+#!/bin/bash -x
+set -e
+
+# Install dir and config dir
+INSTALL_DIR="/opt/openvidu"
+CONFIG_DIR="$${INSTALL_DIR}/config"
+
+
+# OCI Object Storage S3 compatibility endpoint
+# Format: https://<namespace>.compat.objectstorage.<region>.oraclecloud.com
+EXTERNAL_S3_ENDPOINT="https://${local.bucket_namespace}.compat.objectstorage.${var.region}.oraclecloud.com"
+EXTERNAL_S3_REGION="${var.region}"
+EXTERNAL_S3_PATH_STYLE_ACCESS="true"
+EXTERNAL_S3_BUCKET_APP_DATA="${local.bucket_name}"
+
+# Get S3 credentials from variables
+EXTERNAL_S3_ACCESS_KEY="patatas"
+EXTERNAL_S3_SECRET_KEY="patatas"
+
+sed -i "s|EXTERNAL_S3_ENDPOINT=.*|EXTERNAL_S3_ENDPOINT=$EXTERNAL_S3_ENDPOINT|" "$${CONFIG_DIR}/openvidu.env"
+sed -i "s|EXTERNAL_S3_REGION=.*|EXTERNAL_S3_REGION=$EXTERNAL_S3_REGION|" "$${CONFIG_DIR}/openvidu.env"
+sed -i "s|EXTERNAL_S3_PATH_STYLE_ACCESS=.*|EXTERNAL_S3_PATH_STYLE_ACCESS=$EXTERNAL_S3_PATH_STYLE_ACCESS|" "$${CONFIG_DIR}/openvidu.env"
+sed -i "s|EXTERNAL_S3_BUCKET_APP_DATA=.*|EXTERNAL_S3_BUCKET_APP_DATA=$EXTERNAL_S3_BUCKET_APP_DATA|" "$${CONFIG_DIR}/openvidu.env"
+sed -i "s|EXTERNAL_S3_ACCESS_KEY=.*|EXTERNAL_S3_ACCESS_KEY=$EXTERNAL_S3_ACCESS_KEY|" "$${CONFIG_DIR}/openvidu.env"
+sed -i "s|EXTERNAL_S3_SECRET_KEY=.*|EXTERNAL_S3_SECRET_KEY=$EXTERNAL_S3_SECRET_KEY|" "$${CONFIG_DIR}/openvidu.env"
+EOF
+
+  after_install_script = <<-EOF
+#!/bin/bash
+set -e
+
+# Generate URLs
+DOMAIN="$(oci secrets secret-bundle get --secret-id $(oci vault secret list --compartment-id ${var.compartment_ocid} --name DOMAIN_NAME --query 'data[0].id' --raw-output) --query 'data.secret-bundle-content.content' --raw-output | base64 -d)"
+OPENVIDU_URL="https://$${DOMAIN}/"
+LIVEKIT_URL="wss://$${DOMAIN}/"
+DASHBOARD_URL="https://$${DOMAIN}/dashboard/"
+GRAFANA_URL="https://$${DOMAIN}/grafana/"
+MINIO_URL="https://$${DOMAIN}/minio-console/"
+
+# Update shared secret
+/usr/local/bin/store_secret.sh save OPENVIDU_URL "$OPENVIDU_URL"
+/usr/local/bin/store_secret.sh save LIVEKIT_URL "$LIVEKIT_URL"
+/usr/local/bin/store_secret.sh save DASHBOARD_URL "$DASHBOARD_URL"
+/usr/local/bin/store_secret.sh save GRAFANA_URL "$GRAFANA_URL"
+/usr/local/bin/store_secret.sh save MINIO_URL "$MINIO_URL"
+EOF
+
+  update_config_from_secret_script = <<-EOF
+#!/bin/bash -x
+set -e
+
+# Installation directory
+INSTALL_DIR="/opt/openvidu"
+CONFIG_DIR="$${INSTALL_DIR}/config"
+
+# Helper function to get secret value from OCI Vault
+get_secret() {
+  local secret_name="$1"
+  local secret_id=$(oci vault secret list --compartment-id ${var.compartment_ocid} --name "$secret_name" --query 'data[0].id' --raw-output)
+  oci secrets secret-bundle get --secret-id "$secret_id" --query 'data.secret-bundle-content.content' --raw-output | base64 -d
+}
+
+# Helper function to update secret value in OCI Vault
+update_secret() {
+  local secret_name="$1"
+  local secret_value="$2"
+  local secret_id=$(oci vault secret list --compartment-id ${var.compartment_ocid} --name "$secret_name" --query 'data[0].id' --raw-output)
+  echo -n "$secret_value" | base64 | oci vault secret update-base64 --secret-id "$secret_id" --secret-content-content "$(echo -n "$secret_value" | base64)"
+}
+
+# Replace DOMAIN_NAME
+export DOMAIN=$(get_secret DOMAIN_NAME)
+if [[ -n "$DOMAIN" ]]; then
+    sed -i "s/DOMAIN_NAME=.*/DOMAIN_NAME=$DOMAIN/" "$${CONFIG_DIR}/openvidu.env"
+else
+    exit 1
+fi
+
+# Get the rest of the values
+export REDIS_PASSWORD=$(get_secret REDIS_PASSWORD)
+export MONGO_ADMIN_USERNAME=$(get_secret MONGO_ADMIN_USERNAME)
+export MONGO_ADMIN_PASSWORD=$(get_secret MONGO_ADMIN_PASSWORD)
+export MONGO_REPLICA_SET_KEY=$(get_secret MONGO_REPLICA_SET_KEY)
+export DASHBOARD_ADMIN_USERNAME=$(get_secret DASHBOARD_ADMIN_USERNAME)
+export DASHBOARD_ADMIN_PASSWORD=$(get_secret DASHBOARD_ADMIN_PASSWORD)
+export MINIO_ACCESS_KEY=$(get_secret MINIO_ACCESS_KEY)
+export MINIO_SECRET_KEY=$(get_secret MINIO_SECRET_KEY)
+export GRAFANA_ADMIN_USERNAME=$(get_secret GRAFANA_ADMIN_USERNAME)
+export GRAFANA_ADMIN_PASSWORD=$(get_secret GRAFANA_ADMIN_PASSWORD)
+export LIVEKIT_API_KEY=$(get_secret LIVEKIT_API_KEY)
+export LIVEKIT_API_SECRET=$(get_secret LIVEKIT_API_SECRET)
+export MEET_INITIAL_ADMIN_USER=$(get_secret MEET_INITIAL_ADMIN_USER)
+export MEET_INITIAL_ADMIN_PASSWORD=$(get_secret MEET_INITIAL_ADMIN_PASSWORD)
+if [[ "${var.initialMeetApiKey}" != '' ]]; then
+  export MEET_INITIAL_API_KEY=$(get_secret MEET_INITIAL_API_KEY)
+fi
+export ENABLED_MODULES=$(get_secret ENABLED_MODULES)
+
+# Replace rest of the values
+sed -i "s/REDIS_PASSWORD=.*/REDIS_PASSWORD=$REDIS_PASSWORD/" "$${CONFIG_DIR}/openvidu.env"
+sed -i "s/MONGO_ADMIN_USERNAME=.*/MONGO_ADMIN_USERNAME=$MONGO_ADMIN_USERNAME/" "$${CONFIG_DIR}/openvidu.env"
+sed -i "s/MONGO_ADMIN_PASSWORD=.*/MONGO_ADMIN_PASSWORD=$MONGO_ADMIN_PASSWORD/" "$${CONFIG_DIR}/openvidu.env"
+sed -i "s/MONGO_REPLICA_SET_KEY=.*/MONGO_REPLICA_SET_KEY=$MONGO_REPLICA_SET_KEY/" "$${CONFIG_DIR}/openvidu.env"
+sed -i "s/DASHBOARD_ADMIN_USERNAME=.*/DASHBOARD_ADMIN_USERNAME=$DASHBOARD_ADMIN_USERNAME/" "$${CONFIG_DIR}/openvidu.env"
+sed -i "s/DASHBOARD_ADMIN_PASSWORD=.*/DASHBOARD_ADMIN_PASSWORD=$DASHBOARD_ADMIN_PASSWORD/" "$${CONFIG_DIR}/openvidu.env"
+sed -i "s/MINIO_ACCESS_KEY=.*/MINIO_ACCESS_KEY=$MINIO_ACCESS_KEY/" "$${CONFIG_DIR}/openvidu.env"
+sed -i "s/MINIO_SECRET_KEY=.*/MINIO_SECRET_KEY=$MINIO_SECRET_KEY/" "$${CONFIG_DIR}/openvidu.env"
+sed -i "s/GRAFANA_ADMIN_USERNAME=.*/GRAFANA_ADMIN_USERNAME=$GRAFANA_ADMIN_USERNAME/" "$${CONFIG_DIR}/openvidu.env"
+sed -i "s/GRAFANA_ADMIN_PASSWORD=.*/GRAFANA_ADMIN_PASSWORD=$GRAFANA_ADMIN_PASSWORD/" "$${CONFIG_DIR}/openvidu.env"
+sed -i "s/LIVEKIT_API_KEY=.*/LIVEKIT_API_KEY=$LIVEKIT_API_KEY/" "$${CONFIG_DIR}/openvidu.env"
+sed -i "s/LIVEKIT_API_SECRET=.*/LIVEKIT_API_SECRET=$LIVEKIT_API_SECRET/" "$${CONFIG_DIR}/openvidu.env"
+sed -i "s/MEET_INITIAL_ADMIN_USER=.*/MEET_INITIAL_ADMIN_USER=$MEET_INITIAL_ADMIN_USER/" "$${CONFIG_DIR}/meet.env"
+sed -i "s/MEET_INITIAL_ADMIN_PASSWORD=.*/MEET_INITIAL_ADMIN_PASSWORD=$MEET_INITIAL_ADMIN_PASSWORD/" "$${CONFIG_DIR}/meet.env"
+if [[ "${var.initialMeetApiKey}" != '' ]]; then
+  sed -i "s/MEET_INITIAL_API_KEY=.*/MEET_INITIAL_API_KEY=$MEET_INITIAL_API_KEY/" "$${CONFIG_DIR}/meet.env"
+fi
+sed -i "s/ENABLED_MODULES=.*/ENABLED_MODULES=$ENABLED_MODULES/" "$${CONFIG_DIR}/openvidu.env"
+
+# Update URLs in secret
+OPENVIDU_URL="https://$${DOMAIN}/"
+LIVEKIT_URL="wss://$${DOMAIN}/"
+DASHBOARD_URL="https://$${DOMAIN}/dashboard/"
+GRAFANA_URL="https://$${DOMAIN}/grafana/"
+MINIO_URL="https://$${DOMAIN}/minio-console/"
+
+# Update shared secrets
+update_secret DOMAIN_NAME "$DOMAIN"
+update_secret OPENVIDU_URL "$OPENVIDU_URL"
+update_secret LIVEKIT_URL "$LIVEKIT_URL"
+update_secret DASHBOARD_URL "$DASHBOARD_URL"
+update_secret GRAFANA_URL "$GRAFANA_URL"
+update_secret MINIO_URL "$MINIO_URL"
+EOF
+
+  update_secret_from_config_script = <<-EOF
+#!/bin/bash -x
+set -e
+
+# Installation directory
+INSTALL_DIR="/opt/openvidu"
+CONFIG_DIR="$${INSTALL_DIR}/config"
+
+# Helper function to update secret value in OCI Vault
+update_secret() {
+  local secret_name="$1"
+  local secret_value="$2"
+  local secret_id=$(oci vault secret list --compartment-id ${var.compartment_ocid} --name "$secret_name" --query 'data[0].id' --raw-output)
+  oci vault secret update-base64 --secret-id "$secret_id" --secret-content-content "$(echo -n "$secret_value" | base64)"
+}
+
+# Get current values of the config
+REDIS_PASSWORD="$(/usr/local/bin/get_value_from_config.sh REDIS_PASSWORD "$${CONFIG_DIR}/openvidu.env")"
+DOMAIN_NAME="$(/usr/local/bin/get_value_from_config.sh DOMAIN_NAME "$${CONFIG_DIR}/openvidu.env")"
+MONGO_ADMIN_USERNAME="$(/usr/local/bin/get_value_from_config.sh MONGO_ADMIN_USERNAME "$${CONFIG_DIR}/openvidu.env")"
+MONGO_ADMIN_PASSWORD="$(/usr/local/bin/get_value_from_config.sh MONGO_ADMIN_PASSWORD "$${CONFIG_DIR}/openvidu.env")"
+MONGO_REPLICA_SET_KEY="$(/usr/local/bin/get_value_from_config.sh MONGO_REPLICA_SET_KEY "$${CONFIG_DIR}/openvidu.env")"
+MINIO_ACCESS_KEY="$(/usr/local/bin/get_value_from_config.sh MINIO_ACCESS_KEY "$${CONFIG_DIR}/openvidu.env")"
+MINIO_SECRET_KEY="$(/usr/local/bin/get_value_from_config.sh MINIO_SECRET_KEY "$${CONFIG_DIR}/openvidu.env")"
+DASHBOARD_ADMIN_USERNAME="$(/usr/local/bin/get_value_from_config.sh DASHBOARD_ADMIN_USERNAME "$${CONFIG_DIR}/openvidu.env")"
+DASHBOARD_ADMIN_PASSWORD="$(/usr/local/bin/get_value_from_config.sh DASHBOARD_ADMIN_PASSWORD "$${CONFIG_DIR}/openvidu.env")"
+GRAFANA_ADMIN_USERNAME="$(/usr/local/bin/get_value_from_config.sh GRAFANA_ADMIN_USERNAME "$${CONFIG_DIR}/openvidu.env")"
+GRAFANA_ADMIN_PASSWORD="$(/usr/local/bin/get_value_from_config.sh GRAFANA_ADMIN_PASSWORD "$${CONFIG_DIR}/openvidu.env")"
+LIVEKIT_API_KEY="$(/usr/local/bin/get_value_from_config.sh LIVEKIT_API_KEY "$${CONFIG_DIR}/openvidu.env")"
+LIVEKIT_API_SECRET="$(/usr/local/bin/get_value_from_config.sh LIVEKIT_API_SECRET "$${CONFIG_DIR}/openvidu.env")"
+MEET_INITIAL_ADMIN_USER="$(/usr/local/bin/get_value_from_config.sh MEET_INITIAL_ADMIN_USER "$${CONFIG_DIR}/meet.env")"
+MEET_INITIAL_ADMIN_PASSWORD="$(/usr/local/bin/get_value_from_config.sh MEET_INITIAL_ADMIN_PASSWORD "$${CONFIG_DIR}/meet.env")"
+if [[ "${var.initialMeetApiKey}" != '' ]]; then
+  MEET_INITIAL_API_KEY="$(/usr/local/bin/get_value_from_config.sh MEET_INITIAL_API_KEY "$${CONFIG_DIR}/meet.env")"
+fi
+ENABLED_MODULES="$(/usr/local/bin/get_value_from_config.sh ENABLED_MODULES "$${CONFIG_DIR}/openvidu.env")"
+
+# Update secrets in OCI Vault
+update_secret REDIS_PASSWORD "$REDIS_PASSWORD"
+update_secret DOMAIN_NAME "$DOMAIN_NAME"
+update_secret MONGO_ADMIN_USERNAME "$MONGO_ADMIN_USERNAME"
+update_secret MONGO_ADMIN_PASSWORD "$MONGO_ADMIN_PASSWORD"
+update_secret MONGO_REPLICA_SET_KEY "$MONGO_REPLICA_SET_KEY"
+update_secret MINIO_ACCESS_KEY "$MINIO_ACCESS_KEY"
+update_secret MINIO_SECRET_KEY "$MINIO_SECRET_KEY"
+update_secret DASHBOARD_ADMIN_USERNAME "$DASHBOARD_ADMIN_USERNAME"
+update_secret DASHBOARD_ADMIN_PASSWORD "$DASHBOARD_ADMIN_PASSWORD"
+update_secret GRAFANA_ADMIN_USERNAME "$GRAFANA_ADMIN_USERNAME"
+update_secret GRAFANA_ADMIN_PASSWORD "$GRAFANA_ADMIN_PASSWORD"
+update_secret LIVEKIT_API_KEY "$LIVEKIT_API_KEY"
+update_secret LIVEKIT_API_SECRET "$LIVEKIT_API_SECRET"
+update_secret MEET_INITIAL_ADMIN_USER "$MEET_INITIAL_ADMIN_USER"
+update_secret MEET_INITIAL_ADMIN_PASSWORD "$MEET_INITIAL_ADMIN_PASSWORD"
+if [[ "${var.initialMeetApiKey}" != '' ]]; then
+  update_secret MEET_INITIAL_API_KEY "$MEET_INITIAL_API_KEY"
+fi
+update_secret ENABLED_MODULES "$ENABLED_MODULES"
+EOF
+
+  get_value_from_config_script = <<-EOF
+#!/bin/bash -x
+set -e
+
+# Function to get the value of a given key from the environment file
+get_value() {
+    local key="$1"
+    local file_path="$2"
+    # Use grep to find the line with the key, ignoring lines starting with #
+    # Use awk to split on '=' and print the second field, which is the value
+    local value=$(grep -E "^\s*$key\s*=" "$file_path" | awk -F= '{print $2}' | sed 's/#.*//; s/^\s*//; s/\s*$//')
+    # If the value is empty, return "none"
+    if [ -z "$value" ]; then
+        echo "none"
+    else
+        echo "$value"
+    fi
+}
+
+# Check if the correct number of arguments are supplied
+if [ "$#" -ne 2 ]; then
+    echo "Usage: $0 <key> <file_path>"
+    exit 1
+fi
+
+# Get the key and file path from the arguments
+key="$1"
+file_path="$2"
+
+# Get and print the value
+get_value "$key" "$file_path"
+EOF
+
+  store_secret_script = <<-EOF
+#!/bin/bash -x
+set -e
+
+# Modes: save, generate
+# save mode: save the secret in the secret manager
+# generate mode: generate a random password and save it in the secret manager
+MODE="$1"
+
+# Helper to create or update a secret in OCI Vault
+store_in_vault() {
+  local secret_name="$1"
+  local secret_value="$2"
+  local encoded_value
+  encoded_value=$(echo -n "$secret_value" | base64)
+
+  # Check if secret already exists
+  local secret_id
+  secret_id=$(oci vault secret list \
+    --compartment-id ${var.compartment_ocid} \
+    --name "$secret_name" \
+    --query 'data[0].id' \
+    --raw-output 2>/dev/null)
+
+  if [[ -z "$secret_id" || "$secret_id" == "null" ]]; then
+    # Create new secret
+    oci vault secret create-base64 \
+      --compartment-id ${var.compartment_ocid} \
+      --secret-name "$secret_name" \
+      --vault-id ${oci_kms_vault.openvidu_vault.id} \
+      --key-id ${oci_kms_key.openvidu_key.id} \
+      --secret-content-content "$encoded_value" \
+      --secret-content-name "$secret_name" > /dev/null
+  else
+    # Update existing secret
+    oci vault secret update-base64 \
+      --secret-id "$secret_id" \
+      --secret-content-content "$encoded_value" \
+      --secret-content-name "$secret_name" > /dev/null
+  fi
+}
+
+if [[ "$MODE" == "generate" ]]; then
+  SECRET_KEY_NAME="$2"
+  PREFIX="$${3:-}"
+  LENGTH="$${4:-44}"
+  RANDOM_PASSWORD="$(openssl rand -base64 64 | tr -d '+/=\n' | cut -c -$${LENGTH})"
+  RANDOM_PASSWORD="$${PREFIX}$${RANDOM_PASSWORD}"
+  store_in_vault "$SECRET_KEY_NAME" "$RANDOM_PASSWORD"
+  if [[ $? -ne 0 ]]; then
+    echo "Error generating secret" >&2
+    exit 1
+  fi
+  echo "$RANDOM_PASSWORD"
+elif [[ "$MODE" == "save" ]]; then
+  SECRET_KEY_NAME="$2"
+  SECRET_VALUE="$3"
+  store_in_vault "$SECRET_KEY_NAME" "$SECRET_VALUE"
+  if [[ $? -ne 0 ]]; then
+    echo "Error saving secret" >&2
+    exit 1
+  fi
+  echo "$SECRET_VALUE"
+else
+  exit 1
+fi
+EOF
+
+  check_app_ready_script = <<-EOF
+#!/bin/bash
+while true; do
+  HTTP_STATUS=$(curl -Ik http://localhost:7880 | head -n1 | awk '{print $2}')
+  if [ $HTTP_STATUS == 200 ]; then
+    break
+  fi
+  sleep 5
+done
+EOF
+
+  restart_script = <<-EOF
+#!/bin/bash -x
+set -e
+
+# Stop all services
+systemctl stop openvidu
+
+# Update config from secrets
+/usr/local/bin/update_config_from_secret.sh
+
+# Start all services
+systemctl start openvidu
+EOF
+
+  user_data = <<-EOF
+#!/bin/bash -x
+set -eu -o pipefail
+
+# restart.sh
+cat > /usr/local/bin/restart.sh << 'RESTART_EOF'
+${local.restart_script}
+RESTART_EOF
+chmod +x /usr/local/bin/restart.sh
+
+# Check if installation already completed
+if [ -f /usr/local/bin/openvidu_install_counter.txt ]; then
+  # Launch on reboot
+  /usr/local/bin/restart.sh || { echo "[OpenVidu] error restarting OpenVidu"; exit 1; }
+else
+  # install.sh
+  cat > /usr/local/bin/install.sh << 'INSTALL_EOF'
+${local.install_script}
+INSTALL_EOF
+  chmod +x /usr/local/bin/install.sh
+
+  # after_install.sh
+  cat > /usr/local/bin/after_install.sh << 'AFTER_INSTALL_EOF'
+${local.after_install_script}
+AFTER_INSTALL_EOF
+  chmod +x /usr/local/bin/after_install.sh
+
+  # update_config_from_secret.sh
+  cat > /usr/local/bin/update_config_from_secret.sh << 'UPDATE_CONFIG_EOF'
+${local.update_config_from_secret_script}
+UPDATE_CONFIG_EOF
+  chmod +x /usr/local/bin/update_config_from_secret.sh
+
+  # update_secret_from_config.sh
+  cat > /usr/local/bin/update_secret_from_config.sh << 'UPDATE_SECRET_EOF'
+${local.update_secret_from_config_script}
+UPDATE_SECRET_EOF
+  chmod +x /usr/local/bin/update_secret_from_config.sh
+
+  # get_value_from_config.sh
+  cat > /usr/local/bin/get_value_from_config.sh << 'GET_VALUE_EOF'
+${local.get_value_from_config_script}
+GET_VALUE_EOF
+  chmod +x /usr/local/bin/get_value_from_config.sh
+
+  # store_secret.sh
+  cat > /usr/local/bin/store_secret.sh << 'STORE_SECRET_EOF'
+${local.store_secret_script}
+STORE_SECRET_EOF
+  chmod +x /usr/local/bin/store_secret.sh
+
+  # check_app_ready.sh
+  cat > /usr/local/bin/check_app_ready.sh << 'CHECK_APP_EOF'
+${local.check_app_ready_script}
+CHECK_APP_EOF
+  chmod +x /usr/local/bin/check_app_ready.sh
+
+  # config_s3.sh
+  cat > /usr/local/bin/config_s3.sh << 'CONFIG_S3_EOF'
+${local.config_s3_script}
+CONFIG_S3_EOF
+  chmod +x /usr/local/bin/config_s3.sh
+
+  echo "DPkg::Lock::Timeout \"-1\";" > /etc/apt/apt.conf.d/99timeout
+  apt-get update && apt-get install -y
+
+  # Install OCI CLI
+  OCI_CLI_VERSION="3.52.0"
+  curl -L "https://github.com/oracle/oci-cli/releases/download/v$${OCI_CLI_VERSION}/oci-cli-$${OCI_CLI_VERSION}.zip" -o /tmp/oci-cli.zip
+  unzip /tmp/oci-cli.zip -d /tmp/oci-cli
+  /tmp/oci-cli/install.sh --accept-all-defaults
+  export PATH="$PATH:/root/bin"
+
+  export HOME="/root"
+  
+  # Install OpenVidu
+  /usr/local/bin/install.sh || { echo "[OpenVidu] error installing OpenVidu"; exit 1; }
+  
+  # Config S3 bucket
+  # /usr/local/bin/config_s3.sh || { echo "[OpenVidu] error configuring S3 bucket"; exit 1; }
+
+  # Start OpenVidu
+  systemctl start openvidu || { echo "[OpenVidu] error starting OpenVidu"; exit 1; }
+
+  # Update shared secrets
+  /usr/local/bin/after_install.sh || { echo "[OpenVidu] error updating shared secrets"; exit 1; }
+
+  # restart.sh on reboot
+  echo "@reboot /usr/local/bin/restart.sh >> /var/log/openvidu-restart.log 2>&1" | crontab
+  
+  # Mark installation as complete
+  echo "installation_complete" > /usr/local/bin/openvidu_install_counter.txt
+fi
+
+# Wait for the app
+/usr/local/bin/check_app_ready.sh
+EOF
+}
