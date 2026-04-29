@@ -21,6 +21,10 @@ variable "availability_domain" {
   description = "Availability Domain number (1, 2, or 3) to use for resources."
   type        = number
   default     = 1
+  validation {
+    condition     = var.availability_domain >= 1 && var.availability_domain <= 3
+    error_message = "availability_domain must be 1, 2, or 3."
+  }
 }
 
 variable "stackName" {
@@ -101,13 +105,13 @@ variable "instanceType" {
 variable "instanceOCPUs" {
   description = "Number of OCPUs for the instance (if using Flex shape)."
   type        = number
-  default     = 2
+  default     = 4
 }
 
 variable "instanceMemory" {
   description = "Memory in GB for the instance (if using Flex shape)."
   type        = number
-  default     = 8
+  default     = 4
 }
 
 variable "bucketName" {
@@ -124,4 +128,21 @@ variable "additionalInstallFlags" {
     condition     = can(regex("^[A-Za-z0-9, =_.\\-]*$", var.additionalInstallFlags))
     error_message = "Must be a comma-separated list of flags (for example, --flag=value, --bool-flag)."
   }
+}
+
+variable "vault_ocid" {
+  description = "OCI KMS Vault OCID for secrets management. If empty, a new vault will be created."
+  type        = string
+  default     = ""
+}
+
+variable "key_ocid" {
+  description = "OCI KMS Key OCID for secrets management. If empty, a new key will be created."
+  type        = string
+  default     = ""
+}
+
+variable "user_ocid" {
+  description = "OCI User OCID used to create Customer Secret Keys for S3-compatible access to Object Storage."
+  type        = string
 }

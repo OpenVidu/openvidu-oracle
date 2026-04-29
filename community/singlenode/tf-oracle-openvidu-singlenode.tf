@@ -4,10 +4,40 @@ data "oci_identity_availability_domain" "ad" {
   ad_number      = var.availability_domain
 }
 
+# ---------------------- Instance Principals --------------------
+resource "oci_identity_dynamic_group" "openvidu_instances_group" {
+  compartment_id = var.tenancy_ocid
+  name           = "OpenViduInstanceGroup"
+  description    = "Dynamic group for OpenVidu nodes"
+  matching_rule  = "instance.compartment.id = '${var.compartment_ocid}'"
+}
+
+resource "oci_identity_policy" "openvidu_secrets_policy" {
+  compartment_id = var.compartment_ocid
+  name           = "OpenViduSecretsPolicy"
+  description    = "Allow OpenVidu instances to manage secrets and use keys"
+  statements = [
+    "Allow dynamic-group OpenViduInstanceGroup to manage secret-family in compartment id ${var.compartment_ocid}",
+    "Allow dynamic-group OpenViduInstanceGroup to use vaults in compartment id ${var.compartment_ocid}",
+    "Allow dynamic-group OpenViduInstanceGroup to use keys in compartment id ${var.compartment_ocid}"
+  ]
+}
+
+
 # ---------------------------- SSH Key -------------------------
 
-resource "tls_private_key" "openvidu_ssh_key" {
-  algorithm = "ED25519"
+resource "tls_private_key" "openvidu_ssh_key_sn" {
+  algorithm = "RSA"
+}
+
+resource "oci_objectstorage_object" "ssh_private_key" {
+  namespace = data.oci_objectstorage_namespace.ns.namespace
+  bucket    = local.isEmptyBucketName ? oci_objectstorage_bucket.openvidu_bucket[0].name : var.bucketName
+  object    = "openvidu_private_key.pem"
+  content   = tls_private_key.openvidu_ssh_key_sn.private_key_pem
+
+  # Es importante que el objeto se cree después del bucket
+  depends_on = [oci_objectstorage_bucket.openvidu_bucket]
 }
 
 # ------------------------- Networking -------------------------
@@ -17,6 +47,8 @@ resource "oci_core_vcn" "openvidu_vcn" {
   cidr_block     = "10.0.0.0/16"
   compartment_id = var.compartment_ocid
   display_name   = "${var.stackName}-vcn"
+
+  dns_label = "openviduvcn"
 }
 
 ## This is needed to make the VM reachable from the internet. It will be used in the route table to allow outbound traffic to the internet and in the security list to allow inbound traffic on necessary ports.
@@ -42,6 +74,100 @@ resource "oci_core_route_table" "openvidu_rt" {
   }
 }
 
+# Security List (mirrors NSG rules — OCI requires both layers to allow traffic)
+resource "oci_core_security_list" "openvidu_sl" {
+  compartment_id = var.compartment_ocid
+  vcn_id         = oci_core_vcn.openvidu_vcn.id
+  display_name   = "${var.stackName}-sl"
+
+  egress_security_rules {
+    destination = "0.0.0.0/0"
+    protocol    = "all"
+  }
+
+  ingress_security_rules {
+    protocol    = "6"
+    source      = "0.0.0.0/0"
+    description = "SSH"
+    tcp_options {
+      min = 22
+      max = 22
+    }
+  }
+  ingress_security_rules {
+    protocol    = "6"
+    source      = "0.0.0.0/0"
+    description = "HTTP"
+    tcp_options {
+      min = 80
+      max = 80
+    }
+  }
+  ingress_security_rules {
+    protocol    = "6"
+    source      = "0.0.0.0/0"
+    description = "HTTPS"
+    tcp_options {
+      min = 443
+      max = 443
+    }
+  }
+  ingress_security_rules {
+    protocol    = "17"
+    source      = "0.0.0.0/0"
+    description = "TURN UDP 443"
+    udp_options {
+      min = 443
+      max = 443
+    }
+  }
+  ingress_security_rules {
+    protocol    = "6"
+    source      = "0.0.0.0/0"
+    description = "RTMP"
+    tcp_options {
+      min = 1935
+      max = 1935
+    }
+  }
+  ingress_security_rules {
+    protocol    = "6"
+    source      = "0.0.0.0/0"
+    description = "LiveKit/WebRTC TCP"
+    tcp_options {
+      min = 7881
+      max = 7881
+    }
+  }
+  ingress_security_rules {
+    protocol    = "17"
+    source      = "0.0.0.0/0"
+    description = "LiveKit/WebRTC UDP"
+    udp_options {
+      min = 7885
+      max = 7885
+    }
+  }
+  ingress_security_rules {
+    protocol    = "6"
+    source      = "0.0.0.0/0"
+    description = "MinIO"
+    tcp_options {
+      min = 9000
+      max = 9000
+    }
+  }
+  ingress_security_rules {
+    protocol    = "17"
+    source      = "0.0.0.0/0"
+    description = "WebRTC UDP Range"
+    udp_options {
+      min = 50000
+      max = 60000
+    }
+  }
+}
+
 # Subnet
 resource "oci_core_subnet" "openvidu_subnet" {
   cidr_block        = "10.0.1.0/24"
@@ -50,9 +176,9 @@ resource "oci_core_subnet" "openvidu_subnet" {
   display_name      = "${var.stackName}-subnet"
   dns_label         = "openvidusubnet"
   route_table_id    = oci_core_route_table.openvidu_rt.id
-  security_list_ids         = []
-  prohibit_public_ip_on_vnic = false
+  security_list_ids = [oci_core_security_list.openvidu_sl.id]
 }
+
 ##-------------------------------------------------
 
 # Network Security Group
@@ -210,6 +336,13 @@ data "oci_objectstorage_namespace" "ns" {
 # Create credentials in deployment time
 
 
+# Customer Secret Key for S3-compatible access
+# The 'id' attribute is the S3 Access Key ID; 'key' is the S3 Secret Key (sensitive, stored in Terraform state)
+resource "oci_identity_customer_secret_key" "openvidu_s3_key" {
+  display_name = "${var.stackName}-s3-key"
+  user_id      = var.user_ocid
+}
+
 # Object Storage Bucket
 resource "oci_objectstorage_bucket" "openvidu_bucket" {
   count          = local.isEmptyBucketName ? 1 : 0
@@ -221,43 +354,20 @@ resource "oci_objectstorage_bucket" "openvidu_bucket" {
 
 # ------------------------- Compute Instance -------------------------
 
-## Image Selection
-#-------------------------------------------------
 locals {
-  is_arm   = can(regex("A1", var.instanceType))
-  image_id = local.is_arm ? data.oci_core_images.ubuntu_arm.images[0].id : data.oci_core_images.ubuntu_x86.images[0].id
+  is_arm   = length(regexall("\\.(A[0-9]+)\\.", var.instanceType)) > 0
+  image_id = data.oci_core_images.ubuntu.images[0].id
 }
 
-data "oci_core_images" "ubuntu_x86" {
-  compartment_id           = var.compartment_ocid
+data "oci_core_images" "ubuntu" {
+  compartment_id           = var.tenancy_ocid
   operating_system         = "Canonical Ubuntu"
   operating_system_version = "24.04"
-
-  shape = var.instanceType
-
-  filter {
-    name   = "display_name"
-    values = [".*x86_64.*"]
-    regex  = true
-  }
+  shape                    = var.instanceType
+  sort_by                  = "TIMECREATED"
+  sort_order               = "DESC"
 }
 
-data "oci_core_images" "ubuntu_arm" {
-  compartment_id           = var.compartment_ocid
-  operating_system         = "Canonical Ubuntu"
-  operating_system_version = "24.04"
-
-  shape = var.instanceType
-
-  filter {
-    name   = "display_name"
-    values = [".*aarch64.*"]
-    regex  = true
-  }
-}
-#-------------------------------------------------
-
-# Compute Instance
 resource "oci_core_instance" "openvidu_server" {
   availability_domain = data.oci_identity_availability_domain.ad.name
   compartment_id      = var.compartment_ocid
@@ -281,35 +391,50 @@ resource "oci_core_instance" "openvidu_server" {
     subnet_id        = oci_core_subnet.openvidu_subnet.id
     display_name     = "${var.stackName}-vnic"
     assign_public_ip = true
+    nsg_ids          = [oci_core_network_security_group.openvidu_nsg.id]
   }
 
   metadata = {
-    ssh_authorized_keys = tls_private_key.openvidu_ssh_key.public_key_openssh
-    user_data           = base64encode(local.user_data)
+    ssh_authorized_keys = tls_private_key.openvidu_ssh_key_sn.public_key_openssh
+    user_data           = base64gzip(local.user_data)
   }
 
   freeform_tags = {
-    "stack" = var.stackName
+    "stack"    = var.stackName
+    "openvidu" = "true"
   }
 }
 
 # --------------------- Vault for secrets management --------------------
 
 resource "oci_kms_vault" "openvidu_vault" {
+  count          = var.vault_ocid == "" ? 1 : 0
   compartment_id = var.compartment_ocid
   display_name   = "${var.stackName}-vault"
   vault_type     = "DEFAULT"
 }
 
+data "oci_kms_vault" "openvidu_vault" {
+  vault_id = var.vault_ocid != "" ? var.vault_ocid : oci_kms_vault.openvidu_vault[0].id
+}
+
 resource "oci_kms_key" "openvidu_key" {
+  count               = var.key_ocid == "" ? 1 : 0
   compartment_id      = var.compartment_ocid
   display_name        = "${var.stackName}-key"
-  management_endpoint = oci_kms_vault.openvidu_vault.management_endpoint
+  management_endpoint = data.oci_kms_vault.openvidu_vault.management_endpoint
 
   key_shape {
     algorithm = "AES"
     length    = 32
   }
+
+  depends_on = [oci_kms_vault.openvidu_vault]
+}
+
+data "oci_kms_key" "openvidu_key" {
+  management_endpoint = data.oci_kms_vault.openvidu_vault.management_endpoint
+  key_id              = var.key_ocid != "" ? var.key_ocid : oci_kms_key.openvidu_key[0].id
 }
 
 
@@ -326,20 +451,48 @@ set -e
 OPENVIDU_VERSION=main
 DOMAIN=
 
-echo "DPkg::Lock::Timeout \"-1\";" > /etc/apt/apt.conf.d/99timeout
-# Install dependencies
-apt-get update && apt-get install -y \
-  curl \
-  unzip \
-  jq \
-  wget \
-  ca-certificates \
-  gnupg \
-  lsb-release \
-  openssl
+# Apply firewall rules
+systemctl enable firewalld
+systemctl start firewalld
 
-# Create counter file for tracking script executions
-echo 1 > /usr/local/bin/openvidu_install_counter.txt
+iptables -F
+iptables -P INPUT ACCEPT
+systemctl disable netfilter-persistent 2>/dev/null || true
+
+## Add firewall rules
+
+firewall-cmd --add-port=22/tcp
+firewall-cmd --permanent --add-port=22/tcp
+
+firewall-cmd --add-port=80/tcp
+firewall-cmd --permanent --add-port=80/tcp
+
+firewall-cmd --add-port=443/tcp
+firewall-cmd --permanent --add-port=443/tcp
+
+firewall-cmd --add-port=443/udp
+firewall-cmd --permanent --add-port=443/udp
+
+firewall-cmd --add-port=1935/tcp
+firewall-cmd --permanent --add-port=1935/tcp
+
+firewall-cmd --add-port=7881/tcp
+firewall-cmd --permanent --add-port=7881/tcp
+
+firewall-cmd --add-port=7885/udp
+firewall-cmd --permanent --add-port=7885/udp
+
+firewall-cmd --add-port=9000/tcp
+firewall-cmd --permanent --add-port=9000/tcp
+
+firewall-cmd --add-port=50000-60000/udp
+firewall-cmd --permanent --add-port=50000-60000/udp
+
+## Apply rules
+firewall-cmd --reload
+firewall-cmd --runtime-to-permanent
+
+firewall-cmd --list-all
 
 # Get Public IP from OCI metadata
 get_public_ip() {
@@ -400,7 +553,7 @@ INSTALL_COMMAND="sh <(curl -fsSL http://get.openvidu.io/community/singlenode/$OP
 COMMON_ARGS=(
   "--no-tty"
   "--install"
-  "--environment=on_premise"
+  "--environment=oracle"
   "--deployment-type=single_node"
   "--domain-name=$DOMAIN"
   "--enabled-modules='$ENABLED_MODULES'"
@@ -475,9 +628,9 @@ EXTERNAL_S3_REGION="${var.region}"
 EXTERNAL_S3_PATH_STYLE_ACCESS="true"
 EXTERNAL_S3_BUCKET_APP_DATA="${local.bucket_name}"
 
-# Get S3 credentials from variables
-EXTERNAL_S3_ACCESS_KEY="patatas"
-EXTERNAL_S3_SECRET_KEY="patatas"
+# S3 credentials: Customer Secret Key generated by Terraform for this deployment
+EXTERNAL_S3_ACCESS_KEY="${oci_identity_customer_secret_key.openvidu_s3_key.id}"
+EXTERNAL_S3_SECRET_KEY="${oci_identity_customer_secret_key.openvidu_s3_key.key}"
 
 sed -i "s|EXTERNAL_S3_ENDPOINT=.*|EXTERNAL_S3_ENDPOINT=$EXTERNAL_S3_ENDPOINT|" "$${CONFIG_DIR}/openvidu.env"
 sed -i "s|EXTERNAL_S3_REGION=.*|EXTERNAL_S3_REGION=$EXTERNAL_S3_REGION|" "$${CONFIG_DIR}/openvidu.env"
@@ -492,7 +645,7 @@ EOF
 set -e
 
 # Generate URLs
-DOMAIN="$(oci secrets secret-bundle get --secret-id $(oci vault secret list --compartment-id ${var.compartment_ocid} --name DOMAIN_NAME --query 'data[0].id' --raw-output) --query 'data.secret-bundle-content.content' --raw-output | base64 -d)"
+DOMAIN="$(oci secrets secret-bundle get --secret-id $(oci vault secret list --compartment-id ${var.compartment_ocid} --all --query "data[?\"secret-name\"=='DOMAIN_NAME'].id | [0]" --raw-output --auth instance_principal) --query 'data."secret-bundle-content".content' --raw-output --auth instance_principal | base64 -d)"
 OPENVIDU_URL="https://$${DOMAIN}/"
 LIVEKIT_URL="wss://$${DOMAIN}/"
 DASHBOARD_URL="https://$${DOMAIN}/dashboard/"
@@ -518,16 +671,21 @@ CONFIG_DIR="$${INSTALL_DIR}/config"
 # Helper function to get secret value from OCI Vault
 get_secret() {
   local secret_name="$1"
-  local secret_id=$(oci vault secret list --compartment-id ${var.compartment_ocid} --name "$secret_name" --query 'data[0].id' --raw-output)
-  oci secrets secret-bundle get --secret-id "$secret_id" --query 'data.secret-bundle-content.content' --raw-output | base64 -d
+  local secret_id=$(oci vault secret list --compartment-id ${var.compartment_ocid} --all --query "data[?\"secret-name\"=='$secret_name'].id | [0]" --raw-output --auth instance_principal)
+  oci secrets secret-bundle get --secret-id "$secret_id" --query 'data."secret-bundle-content".content' --raw-output --auth instance_principal | base64 -d
 }
 
 # Helper function to update secret value in OCI Vault
 update_secret() {
   local secret_name="$1"
   local secret_value="$2"
-  local secret_id=$(oci vault secret list --compartment-id ${var.compartment_ocid} --name "$secret_name" --query 'data[0].id' --raw-output)
-  echo -n "$secret_value" | base64 | oci vault secret update-base64 --secret-id "$secret_id" --secret-content-content "$(echo -n "$secret_value" | base64)"
+  local secret_id
+  secret_id=$(oci vault secret list --compartment-id ${var.compartment_ocid} --all --query "data[?\"secret-name\"=='$secret_name' && \"lifecycle-state\"=='ACTIVE'].id | [0]" --raw-output --auth instance_principal)
+  if [[ -z "$secret_id" || "$secret_id" == "null" ]]; then
+    echo "Secret $secret_name not found in vault" >&2
+    return 1
+  fi
+  oci vault secret update-base64 --secret-id "$secret_id" --secret-content-content "$(echo -n "$secret_value" | base64)" --enable-auto-generation false --auth instance_principal
 }
 
 # Replace DOMAIN_NAME
@@ -606,8 +764,13 @@ CONFIG_DIR="$${INSTALL_DIR}/config"
 update_secret() {
   local secret_name="$1"
   local secret_value="$2"
-  local secret_id=$(oci vault secret list --compartment-id ${var.compartment_ocid} --name "$secret_name" --query 'data[0].id' --raw-output)
-  oci vault secret update-base64 --secret-id "$secret_id" --secret-content-content "$(echo -n "$secret_value" | base64)"
+  local secret_id
+  secret_id=$(oci vault secret list --compartment-id ${var.compartment_ocid} --all --query "data[?\"secret-name\"=='$secret_name' && \"lifecycle-state\"=='ACTIVE'].id | [0]" --raw-output --auth instance_principal)
+  if [[ -z "$secret_id" || "$secret_id" == "null" ]]; then
+    echo "Secret $secret_name not found in vault" >&2
+    return 1
+  fi
+  oci vault secret update-base64 --secret-id "$secret_id" --secret-content-content "$(echo -n "$secret_value" | base64)" --enable-auto-generation false --auth instance_principal
 }
 
 # Get current values of the config
@@ -702,29 +865,51 @@ store_in_vault() {
   local encoded_value
   encoded_value=$(echo -n "$secret_value" | base64)
 
-  # Check if secret already exists
+  # Check if secret already exists and is ACTIVE
   local secret_id
   secret_id=$(oci vault secret list \
     --compartment-id ${var.compartment_ocid} \
-    --name "$secret_name" \
-    --query 'data[0].id' \
-    --raw-output 2>/dev/null)
+    --all \
+    --query "data[?\"secret-name\"=='$secret_name' && \"lifecycle-state\"=='ACTIVE'].id | [0]" \
+    --raw-output \
+    --auth instance_principal)
 
   if [[ -z "$secret_id" || "$secret_id" == "null" ]]; then
-    # Create new secret
-    oci vault secret create-base64 \
+    # Check if there's a pending-deletion secret to restore first
+    local pending_id
+    pending_id=$(oci vault secret list \
       --compartment-id ${var.compartment_ocid} \
-      --secret-name "$secret_name" \
-      --vault-id ${oci_kms_vault.openvidu_vault.id} \
-      --key-id ${oci_kms_key.openvidu_key.id} \
-      --secret-content-content "$encoded_value" \
-      --secret-content-name "$secret_name" > /dev/null
+      --all \
+      --query "data[?\"secret-name\"=='$secret_name' && (\"lifecycle-state\"=='PENDING_DELETION' || \"lifecycle-state\"=='SCHEDULED_FOR_DELETION')].id | [0]" \
+      --raw-output \
+      --auth instance_principal)
+
+    if [[ -n "$pending_id" && "$pending_id" != "null" ]]; then
+      # Restore secret from pending deletion, then update
+      oci vault secret cancel-secret-deletion --secret-id "$pending_id" --auth instance_principal > /dev/null
+      oci vault secret update-base64 \
+        --secret-id "$pending_id" \
+        --secret-content-content "$encoded_value" \
+        --enable-auto-generation false \
+        --auth instance_principal > /dev/null
+    else
+      # Create new secret
+      oci vault secret create-base64 \
+        --compartment-id ${var.compartment_ocid} \
+        --secret-name "$secret_name" \
+        --vault-id ${var.vault_ocid != "" ? var.vault_ocid : oci_kms_vault.openvidu_vault[0].id} \
+        --key-id ${var.key_ocid != "" ? var.key_ocid : oci_kms_key.openvidu_key[0].id} \
+        --secret-content-content "$encoded_value" \
+        --secret-content-name "$secret_name" \
+        --auth instance_principal > /dev/null
+    fi
   else
-    # Update existing secret
+    # Update existing active secret
     oci vault secret update-base64 \
       --secret-id "$secret_id" \
       --secret-content-content "$encoded_value" \
-      --secret-content-name "$secret_name" > /dev/null
+      --enable-auto-generation false \
+      --auth instance_principal > /dev/null
   fi
 }
 
@@ -757,7 +942,7 @@ EOF
   check_app_ready_script = <<-EOF
 #!/bin/bash
 while true; do
-  HTTP_STATUS=$(curl -Ik http://localhost:7880 | head -n1 | awk '{print $2}')
+  HTTP_STATUS=$(curl -Ik http://localhost:7880/health/caddy | head -n1 | awk '{print $2}')
   if [ $HTTP_STATUS == 200 ]; then
     break
   fi
@@ -842,23 +1027,34 @@ ${local.config_s3_script}
 CONFIG_S3_EOF
   chmod +x /usr/local/bin/config_s3.sh
 
-  echo "DPkg::Lock::Timeout \"-1\";" > /etc/apt/apt.conf.d/99timeout
-  apt-get update && apt-get install -y
+echo "DPkg::Lock::Timeout \"-1\";" > /etc/apt/apt.conf.d/99timeout
+# Install dependencies
+apt-get update && apt-get install -y \
+  curl \
+  python3-pip \
+  jq \
+  wget \
+  ca-certificates \
+  gnupg \
+  lsb-release \
+  openssl \
+  pipx \
+  firewalld
 
-  # Install OCI CLI
+  # Install pipx and OCI CLI via pipx (The correct way for modern Linux)
+  apt-get update && apt-get install -y pipx
   OCI_CLI_VERSION="3.52.0"
-  curl -L "https://github.com/oracle/oci-cli/releases/download/v$${OCI_CLI_VERSION}/oci-cli-$${OCI_CLI_VERSION}.zip" -o /tmp/oci-cli.zip
-  unzip /tmp/oci-cli.zip -d /tmp/oci-cli
-  /tmp/oci-cli/install.sh --accept-all-defaults
-  export PATH="$PATH:/root/bin"
-
+  pipx install oci-cli==$${OCI_CLI_VERSION}
+  
+  # Add pipx bin directory to PATH so the 'oci' command is found
   export HOME="/root"
+  export PATH="$PATH:$HOME/.local/bin"
   
   # Install OpenVidu
   /usr/local/bin/install.sh || { echo "[OpenVidu] error installing OpenVidu"; exit 1; }
   
   # Config S3 bucket
-  # /usr/local/bin/config_s3.sh || { echo "[OpenVidu] error configuring S3 bucket"; exit 1; }
+  /usr/local/bin/config_s3.sh || { echo "[OpenVidu] error configuring S3 bucket"; exit 1; }
 
   # Start OpenVidu
   systemctl start openvidu || { echo "[OpenVidu] error starting OpenVidu"; exit 1; }
