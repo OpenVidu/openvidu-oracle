@@ -1,0 +1,107 @@
+# =================================================================
+#  REQUIRED CONFIGURATION
+#  You must fill in these variables for the deployment to work.
+# =================================================================
+
+# Your OCI Tenancy OCID.
+# Found at: OCI Console → Profile → Tenancy → OCID
+tenancy_ocid = "ocid1.tenancy.oc1..xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+# OCI Compartment OCID where all resources will be created.
+# Found at: OCI Console → Identity → Compartments → <your compartment> → OCID
+compartment_ocid = "ocid1.compartment.oc1..xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+# OCI User OCID used to generate S3-compatible credentials for Object Storage.
+# Found at: OCI Console → Profile → User Settings → OCID
+user_ocid = "ocid1.user.oc1..xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+# Name to identify your deployment (e.g., "openvidu-singlenode").
+stackName = "openvidu-singlenode"
+
+# =================================================================
+#  OPTIONAL CONFIGURATION
+#  Uncomment (remove the #) only if you need to change the default value.
+# =================================================================
+
+# --- Region and Availability Domain ---
+
+# OCI region where resources will be created. Default: eu-frankfurt-1.
+# Examples: us-ashburn-1, us-phoenix-1, eu-amsterdam-1, ap-tokyo-1.
+# Leave commented to use the default.
+# region = "eu-frankfurt-1"
+
+# Availability Domain number (1, 2, or 3). Default: 1.
+# Leave commented to use the default.
+# availability_domain = 1
+
+
+# --- Instance Size ---
+
+# OCI Shape for the instance. Default: VM.Standard.E4.Flex.
+# Leave commented to use the default.
+# instanceType = "VM.Standard.E4.Flex"
+
+# Number of OCPUs (only for Flex shapes). Default: 4.
+# Leave commented to use the default.
+# instanceOCPUs = 4
+
+# Memory in GB (only for Flex shapes). Default: 4.
+# Leave commented to use the default.
+# instanceMemory = 4
+
+
+# --- Domain and SSL Certificates ---
+
+# Certificate type. Default: "letsencrypt".
+# Options:
+#   - "letsencrypt" (Recommended for production, requires domain or uses sslip.io).
+#   - "selfsigned"  (For local testing only, browser will show warning).
+#   - "owncert"     (If you already have your own certificate files).
+# Leave commented to use the default.
+# certificateType = "letsencrypt"
+
+# Your real domain name (e.g., "video.mycompany.com").
+# Required if using 'owncert'. Recommended for 'letsencrypt'.
+# Leave empty or commented to use an automatic sslip.io domain.
+# domainName = "video.mycompany.com"
+
+# Previously created OCI Reserved Public IP address to assign to the instance.
+# Leave empty or commented to create a new public IP automatically.
+# publicIpAddress = "1.2.3.4"
+
+# Only if using 'owncert': public certificate and private key contents in base64.
+# ownPublicCertificate  = "base64_of_your_public_certificate.pem"
+# ownPrivateCertificate = "base64_of_your_private_certificate.pem"
+
+
+# --- Security and Access ---
+
+# Password for the Meet admin user.
+# If left empty or commented, a random one will be generated (check terraform output).
+# initialMeetAdminPassword = "YourSecurePassword123"
+
+# Initial API Key for OpenVidu Meet.
+# If left empty or commented, no initial key will be configured.
+# initialMeetApiKey = "YourSecretApiKey"
+
+
+# --- Storage (OCI Object Storage) ---
+
+# Name of an existing OCI Object Storage bucket for application data and recordings.
+# If left empty or commented, a new bucket named "openvidu-appdata" will be created.
+# bucketName = "my-openvidu-bucket"
+
+
+# --- KMS Vault (Secrets Management) ---
+
+# OCID of an existing OCI KMS Vault for secrets. If empty, a new vault will be created.
+# vault_ocid = "ocid1.vault.oc1.eu-frankfurt-1.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+# OCID of an existing OCI KMS Key. If empty, a new key will be created.
+# key_ocid = "ocid1.key.oc1.eu-frankfurt-1.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+
+# --- Advanced ---
+
+# Extra flags for the OpenVidu installer (comma-separated).
+# additionalInstallFlags = "--flag1=value, --flag2"

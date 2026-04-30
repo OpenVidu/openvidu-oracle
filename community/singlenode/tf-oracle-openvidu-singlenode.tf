@@ -33,7 +33,7 @@ resource "tls_private_key" "openvidu_ssh_key_sn" {
 resource "oci_objectstorage_object" "ssh_private_key" {
   namespace = data.oci_objectstorage_namespace.ns.namespace
   bucket    = local.isEmptyBucketName ? oci_objectstorage_bucket.openvidu_bucket[0].name : var.bucketName
-  object    = "openvidu_private_key.pem"
+  object    = "openvidu_private_key_sn.pem"
   content   = tls_private_key.openvidu_ssh_key_sn.private_key_pem
 
   # Es importante que el objeto se cree después del bucket
@@ -953,6 +953,10 @@ EOF
   restart_script = <<-EOF
 #!/bin/bash -x
 set -e
+
+# Make OCI CLI available (installed via pipx under /root/.local/bin)
+export HOME="/root"
+export PATH="$PATH:$HOME/.local/bin"
 
 # Stop all services
 systemctl stop openvidu
