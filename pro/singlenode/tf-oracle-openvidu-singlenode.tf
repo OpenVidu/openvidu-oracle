@@ -1,3 +1,8 @@
+# Random suffix for unique naming
+resource "random_id" "suffix" {
+  byte_length = 3
+}
+
 # Get Availability Domain
 data "oci_identity_availability_domain" "ad" {
   compartment_id = var.tenancy_ocid
@@ -33,7 +38,7 @@ resource "tls_private_key" "openvidu_ssh_key_snpro" {
 resource "oci_objectstorage_object" "ssh_private_key" {
   namespace = data.oci_objectstorage_namespace.ns.namespace
   bucket    = local.isEmptyBucketName ? oci_objectstorage_bucket.openvidu_bucket[0].name : var.bucketName
-  object    = "openvidu_private_key_snpro.pem"
+  object    = "${var.stackName}-private-key.pem"
   content   = tls_private_key.openvidu_ssh_key_snpro.private_key_pem
 
   # Es importante que el objeto se cree después del bucket
@@ -371,7 +376,7 @@ resource "oci_objectstorage_bucket" "openvidu_bucket" {
   count          = local.isEmptyBucketName ? 1 : 0
   compartment_id = var.compartment_ocid
   namespace      = data.oci_objectstorage_namespace.ns.namespace
-  name           = "openvidu-appdata"
+  name           = "${var.stackName}-appdata-${random_id.suffix.hex}"
   storage_tier   = "Standard"
 }
 
