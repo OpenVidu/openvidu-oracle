@@ -471,7 +471,7 @@ locals {
 #!/bin/bash -x
 set -e
 
-OPENVIDU_VERSION=3.7.0
+OPENVIDU_VERSION=main
 DOMAIN=
 
 # Apply firewall rules
