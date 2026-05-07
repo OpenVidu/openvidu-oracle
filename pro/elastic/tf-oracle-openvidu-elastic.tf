@@ -679,10 +679,10 @@ resource "oci_autoscaling_auto_scaling_configuration" "media_node_autoscaling" {
       }
     }
     # OCI provider ≥8.12.0 requires at least one scale-in rule in the policy.
-    # Threshold is LT 1% — only fires when CPU is essentially 0% (no active sessions).
-    # Real scale-in is owned entirely by the pre-drain daemon (detaches itself,
-    # drains with no time limit, then self-terminates). The daemon's re-verification
-    # step aborts drain if a session starts before detach commits.
+    # Threshold LT 0% is mathematically impossible — CPU utilisation is always ≥ 0.
+    # This rule exists ONLY to satisfy the provider; it will NEVER fire.
+    # All scale-in is owned by the session-aware pre-drain daemon, which checks
+    # for active LiveKit rooms and only drains nodes with zero meetings.
     rules {
       action {
         type  = "CHANGE_COUNT_BY"
@@ -693,7 +693,7 @@ resource "oci_autoscaling_auto_scaling_configuration" "media_node_autoscaling" {
         metric_type = "CPU_UTILIZATION"
         threshold {
           operator = "LT"
-          value    = 1
+          value    = 0
         }
       }
     }
@@ -741,16 +741,20 @@ locals {
   yq_arch         = local.is_arm_instance ? "arm64" : "amd64"
   yq_sha256       = local.is_arm_instance ? "10a4a2093090363a00b55ad52e132a082f9652970cb8f1ad35a1ae048b917e6e" : "3fa3c1c32d94520102ea4d853d03c3ab907867d964540e896410ad8a7fc6c8f7"
 
-  # Pre-drain daemon: monitors pool size and local CPU. When scale-in conditions are met
-  # and this is the oldest instance in the pool, the daemon detaches itself from the pool
-  # (pool target decrements by 1, OCI spawns no replacement), drains OpenVidu containers
-  # with no time constraint, then self-terminates via the OCI API.
-  # This is the OCI equivalent of GCP's "remove from MIG + self-delete" — the instance
-  # is fully decoupled from the autoscaler before drain starts, so no ACPI timeout applies.
+  # Pre-drain daemon: session-aware scale-in for OpenVidu media nodes.
+  # Queries the local LiveKit API for active rooms — only scales in nodes with
+  # ZERO active meetings. CPU is used as a secondary signal only.
+  # When conditions are met and this is the oldest instance in the pool, the daemon
+  # detaches itself (pool target decrements by 1, no replacement spawned), sends
+  # SIGQUIT to stop accepting new sessions, waits for any remaining sessions to end
+  # (no time constraint), then self-terminates via the OCI API.
+  # The instance is fully decoupled from the autoscaler before drain starts,
+  # so OCI's 15-min ACPI timeout never applies.
   pre_drain_daemon_script = <<-EOF
 #!/bin/bash
-# OpenVidu Pre-drain Daemon for OCI
-# Strategy: sustained idle detection -> SIGQUIT -> detach from pool -> wait indefinitely -> self-terminate
+# OpenVidu Pre-drain Daemon for OCI (session-aware)
+# Strategy: check active rooms -> sustained idle detection -> SIGQUIT -> detach -> wait -> self-terminate
+# NEVER scales in a node that has active meetings/rooms.
 
 source /etc/openvidu/predrain.conf
 
@@ -799,9 +803,74 @@ oci_call() {
     done
 }
 
+# Generate a LiveKit-compatible JWT (HS256) for RoomService/ListRooms.
+# Uses only openssl (always present) — no external JWT tool needed.
+generate_livekit_jwt() {
+    local api_key="$1" api_secret="$2"
+    local header payload signature now exp
+
+    header=$(printf '{"alg":"HS256","typ":"JWT"}' | openssl base64 -A | tr '+/' '-_' | tr -d '=')
+    now=$(date +%s)
+    exp=$(( now + 600 ))
+    payload=$(printf '{"iss":"%s","sub":"%s","iat":%d,"exp":%d,"video":{"roomList":true}}' \
+        "$api_key" "$api_key" "$now" "$exp" \
+        | openssl base64 -A | tr '+/' '-_' | tr -d '=')
+    signature=$(printf '%s.%s' "$header" "$payload" \
+        | openssl dgst -sha256 -hmac "$api_secret" -binary \
+        | openssl base64 -A | tr '+/' '-_' | tr -d '=')
+
+    printf '%s.%s.%s' "$header" "$payload" "$signature"
+}
+
+# Query the local LiveKit server for the number of active rooms.
+# Returns the room count, or -1 on error (API unreachable, auth failure, etc.).
+get_active_rooms() {
+    local jwt response room_count
+    jwt=$(generate_livekit_jwt "$LIVEKIT_API_KEY" "$LIVEKIT_API_SECRET")
+    response=$(curl -sf -m 10 \
+        -H "Authorization: Bearer $jwt" \
+        -H "Content-Type: application/json" \
+        -d '{}' \
+        "http://localhost:7880/twirp/livekit.RoomService/ListRooms" 2>/dev/null) || { echo "-1"; return 1; }
+    room_count=$(echo "$response" | jq '.rooms | length' 2>/dev/null) || { echo "-1"; return 1; }
+    echo "$room_count"
+}
+
+# Read a secret value from OCI Vault via Instance Principal
+get_secret() {
+    local secret_name="$1"
+    local secret_id
+    secret_id=$(oci vault secret list \
+        --compartment-id "$COMPARTMENT_ID" \
+        --all \
+        --query "data[?\"secret-name\"=='$secret_name' && \"lifecycle-state\"=='ACTIVE'].id | [0]" \
+        --raw-output \
+        --auth instance_principal 2>/dev/null) || return 1
+    [ -z "$secret_id" ] && return 1
+    oci secrets secret-bundle get \
+        --secret-id "$secret_id" \
+        --query 'data."secret-bundle-content".content' \
+        --raw-output \
+        --auth instance_principal 2>/dev/null | base64 -d
+}
+
 INSTANCE_OCID=$(curl -sf -H "Authorization: Bearer Oracle" \
     "http://169.254.169.254/opc/v2/instance/" | jq -r '.id')
 log "Started. Instance: $INSTANCE_OCID"
+
+# Fetch LiveKit API credentials from OCI Vault — needed to check active rooms
+log "Fetching LiveKit API credentials from vault..."
+LIVEKIT_API_KEY=""
+LIVEKIT_API_SECRET=""
+while [ -z "$LIVEKIT_API_KEY" ] || [ -z "$LIVEKIT_API_SECRET" ]; do
+    LIVEKIT_API_KEY=$(get_secret LIVEKIT_API_KEY 2>/dev/null) || true
+    LIVEKIT_API_SECRET=$(get_secret LIVEKIT_API_SECRET 2>/dev/null) || true
+    if [ -z "$LIVEKIT_API_KEY" ] || [ -z "$LIVEKIT_API_SECRET" ]; then
+        log "Waiting for LiveKit credentials in vault..."
+        sleep 30
+    fi
+done
+log "LiveKit API credentials loaded."
 
 # Discover pool OCID at runtime via exact display-name match.
 # Cannot embed pool OCID at Terraform time: instance_configuration -> user_data -> pool_id
@@ -824,14 +893,12 @@ while [ -z "$POOL_ID" ]; do
 done
 log "Pool discovered: $POOL_ID"
 
-# Require N consecutive idle readings before acting — avoids reacting to transient CPU dips
+# Require N consecutive fully-idle readings (0 rooms + low CPU) before acting
 IDLE_STREAK=0
-REQUIRED_STREAK=3   # 3 × ~62s ≈ 3 minutes of sustained low CPU
+REQUIRED_STREAK=3   # 3 × ~62s ≈ 3 minutes of sustained idle with no rooms
 
 while true; do
     # Only count RUNNING instances — excludes PROVISIONING, TERMINATING, etc.
-    # OCI instance-pool list-instances returns InstancePoolInstanceSummary with a 'state'
-    # field (compute instance state: RUNNING, STOPPED, ...) not 'lifecycle-state'.
     POOL_JSON=$(oci_call oci compute-management instance-pool list-instances \
         --instance-pool-id "$POOL_ID" \
         --compartment-id "$COMPARTMENT_ID" \
@@ -850,8 +917,26 @@ while true; do
         continue
     fi
 
+    # PRIMARY GUARD: check for active rooms on this node via LiveKit API.
+    # A node with ANY active room must NEVER be considered for scale-in.
+    ACTIVE_ROOMS=$(get_active_rooms)
+    if [ "$ACTIVE_ROOMS" = "-1" ]; then
+        log "Failed to query active rooms (API error). Skipping cycle."
+        IDLE_STREAK=0
+        sleep 60
+        continue
+    fi
+
+    if [ "$ACTIVE_ROOMS" -gt 0 ]; then
+        [ "$IDLE_STREAK" -gt 0 ] && log "Node has $ACTIVE_ROOMS active room(s). Resetting idle streak."
+        IDLE_STREAK=0
+        sleep 60
+        continue
+    fi
+
+    # SECONDARY SIGNAL: CPU usage (confirms the node is genuinely idle)
     LOCAL_CPU=$(get_cpu_usage)
-    log "Pool: $POOL_SIZE running, local CPU: $${LOCAL_CPU}%"
+    log "Pool: $POOL_SIZE running, local CPU: $${LOCAL_CPU}%, active rooms: $ACTIVE_ROOMS"
 
     if [ "$LOCAL_CPU" -ge "$SCALE_IN_CPU_THRESHOLD" ]; then
         [ "$IDLE_STREAK" -gt 0 ] && log "CPU above threshold. Resetting idle streak."
@@ -861,7 +946,7 @@ while true; do
     fi
 
     IDLE_STREAK=$(( IDLE_STREAK + 1 ))
-    log "Idle streak: $IDLE_STREAK/$REQUIRED_STREAK (cpu=$${LOCAL_CPU}% < $${SCALE_IN_CPU_THRESHOLD}%)"
+    log "Idle streak: $IDLE_STREAK/$REQUIRED_STREAK (cpu=$${LOCAL_CPU}% < $${SCALE_IN_CPU_THRESHOLD}%, rooms=0)"
 
     if [ "$IDLE_STREAK" -lt "$REQUIRED_STREAK" ]; then
         sleep 60
@@ -881,10 +966,11 @@ while true; do
 
     # Random jitter 0-30s: staggers decisions from nodes that simultaneously passed the check
     JITTER=$(( RANDOM % 30 ))
-    log "We are the oldest idle node. Waiting $${JITTER}s jitter before committing..."
+    log "We are the oldest idle node with 0 rooms. Waiting $${JITTER}s jitter before committing..."
     sleep "$JITTER"
 
-    # Re-verify after jitter — another node may have detached, changing the oldest candidate
+    # Re-verify ALL conditions after jitter — another node may have detached, or a room
+    # may have been created in the jitter window.
     POOL_JSON_RV=$(oci_call oci compute-management instance-pool list-instances \
         --instance-pool-id "$POOL_ID" \
         --compartment-id "$COMPARTMENT_ID" \
@@ -897,16 +983,20 @@ while true; do
     OLDEST_RV=$(echo "$RUNNING_RV" | jq -r 'sort_by(.["time-created"]) | .[0].id')
     CPU_RV=$(get_cpu_usage)
 
+    # Re-check active rooms — CRITICAL guard against race condition
+    ROOMS_RV=$(get_active_rooms)
+
     if [ "$POOL_SIZE_RV" -le "$MIN_NODES" ] || \
        [ "$CPU_RV" -ge "$SCALE_IN_CPU_THRESHOLD" ] || \
-       [ "$OLDEST_RV" != "$INSTANCE_OCID" ]; then
-        log "Conditions changed after jitter (pool=$POOL_SIZE_RV, cpu=$${CPU_RV}%, oldest=$OLDEST_RV). Aborting."
+       [ "$OLDEST_RV" != "$INSTANCE_OCID" ] || \
+       [ "$ROOMS_RV" != "0" ]; then
+        log "Conditions changed after jitter (pool=$POOL_SIZE_RV, cpu=$${CPU_RV}%, oldest=$OLDEST_RV, rooms=$ROOMS_RV). Aborting."
         IDLE_STREAK=0
         sleep 60
         continue
     fi
 
-    log "Committed to scale-in. Pool: $POOL_SIZE_RV, CPU: $${CPU_RV}%"
+    log "Committed to scale-in. Pool: $POOL_SIZE_RV, CPU: $${CPU_RV}%, Rooms: 0"
     touch "$DRAIN_LOCK"
 
     # Step 1: SIGQUIT BEFORE detach — stops OpenVidu accepting new sessions while still
@@ -934,8 +1024,8 @@ while true; do
         && log "Detached from pool." \
         || log "Warning: detach failed — drain continues independently."
 
-    # Step 3: Wait indefinitely for all sessions to end.
-    # Instance is outside the pool — no OCI timeout applies here.
+    # Step 3: Wait for any sessions that may have started in the tiny window between
+    # the last room check and SIGQUIT. Instance is outside the pool — no OCI timeout applies.
     if command -v docker &>/dev/null; then
         log "Waiting for all sessions to end (no time limit)..."
         while [ "$(docker ps --filter 'label=openvidu-agent=true' -q 2>/dev/null | wc -l)" -gt 0 ] || \
@@ -963,8 +1053,9 @@ while true; do
 done
 EOF
 
-  # Fallback graceful shutdown — runs only if ACPI shutdown arrives before the pre-drain
-  # daemon completes (e.g., manual termination or the ~30s race window before jitter+detach).
+  # Fallback graceful shutdown — runs only if an ACPI shutdown arrives outside the daemon's
+  # control (e.g., manual termination via console). The OCI native autoscaler scale-in rule
+  # uses an impossible threshold (CPU < 0%) so it will never trigger.
   # Checks the drain lock to avoid sending SIGQUIT twice if the daemon already acted.
   graceful_shutdown_script = <<-EOF
 #!/bin/bash
