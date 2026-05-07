@@ -1,0 +1,20 @@
+tenancy_ocid     = "ocid1.tenancy.oc1..your-tenancy-ocid"
+compartment_ocid = "ocid1.compartment.oc1..your-compartment-ocid"
+stackName        = "ov-ha"
+region           = "eu-madrid-1"
+user_ocid        = "ocid1.user.oc1..your-user-ocid"
+openviduLicense  = "your-openvidu-license-key"
+
+# Optional: provide existing vault/key to avoid creating new ones
+# vault_ocid = "ocid1.vault.oc1.eu-madrid-1...."
+# key_ocid   = "ocid1.key.oc1.eu-madrid-1...."
+
+# Optional: provide existing buckets
+# bucketAppDataName     = "my-existing-appdata-bucket"
+# bucketClusterDataName = "my-existing-clusterdata-bucket"
+
+# Optional: provide an existing reserved public IP OCID for the NLB
+# publicIpAddress = "ocid1.publicip.oc1.eu-madrid-1...."
+
+# Optional: set a custom domain name (otherwise sslip.io is used)
+# domainName = "openvidu.example.com"
