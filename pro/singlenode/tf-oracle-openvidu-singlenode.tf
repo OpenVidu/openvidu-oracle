@@ -18,14 +18,28 @@ resource "oci_identity_dynamic_group" "openvidu_instances_group" {
 }
 
 resource "oci_identity_policy" "openvidu_secrets_policy" {
-  compartment_id = var.compartment_ocid
+  # Must be at tenancy (root) level so that cross-compartment grants work
+  # when the vault lives in a different compartment than the deployment.
+  compartment_id = var.tenancy_ocid
   name           = "OpenViduSecretsPolicy"
   description    = "Allow OpenVidu instances to manage secrets and use keys"
   statements = [
+    # Secrets are stored in the deployment compartment
     "Allow dynamic-group OpenViduInstanceGroup to manage secret-family in compartment id ${var.compartment_ocid}",
-    "Allow dynamic-group OpenViduInstanceGroup to use vaults in compartment id ${var.compartment_ocid}",
-    "Allow dynamic-group OpenViduInstanceGroup to use keys in compartment id ${var.compartment_ocid}"
+    # Vault and key may be in a different compartment — use the vault's actual compartment
+    "Allow dynamic-group OpenViduInstanceGroup to use vaults in compartment id ${data.oci_kms_vault.openvidu_vault.compartment_id}",
+    "Allow dynamic-group OpenViduInstanceGroup to use keys in compartment id ${data.oci_kms_vault.openvidu_vault.compartment_id}",
   ]
+}
+
+# OCI IAM policy propagation can take 60-120 s after creation/recreation.
+# Wait before launching the instance so instance_principal auth is ready.
+resource "time_sleep" "wait_for_iam_propagation" {
+  depends_on = [
+    oci_identity_dynamic_group.openvidu_instances_group,
+    oci_identity_policy.openvidu_secrets_policy,
+  ]
+  create_duration = "120s"
 }
 
 
@@ -431,6 +445,8 @@ resource "oci_core_instance" "openvidu_server" {
     "stack"    = var.stackName
     "openvidu" = "true"
   }
+
+  depends_on = [time_sleep.wait_for_iam_propagation]
 }
 
 # --------------------- Vault for secrets management --------------------
@@ -446,6 +462,33 @@ data "oci_kms_vault" "openvidu_vault" {
   vault_id = var.vault_ocid != "" ? var.vault_ocid : oci_kms_vault.openvidu_vault[0].id
 }
 
+# OCI marks the vault ACTIVE before its management endpoint DNS is resolvable.
+# Wait until the hostname resolves before creating the key.
+resource "null_resource" "wait_for_vault_dns" {
+  count = var.vault_ocid == "" ? 1 : 0
+  triggers = {
+    vault_id = oci_kms_vault.openvidu_vault[0].id
+  }
+  depends_on = [oci_kms_vault.openvidu_vault]
+  provisioner "local-exec" {
+    command = <<-SH
+      HOST=$(echo "${data.oci_kms_vault.openvidu_vault.management_endpoint}" | sed 's|https://||' | sed 's|/.*||')
+      echo "[vault-dns] Waiting for $HOST to resolve (up to 15 min)..."
+      sleep 30
+      for i in $(seq 1 168); do
+        if getent hosts "$HOST" > /dev/null 2>&1 || host "$HOST" > /dev/null 2>&1 || nslookup "$HOST" > /dev/null 2>&1; then
+          echo "[vault-dns] Resolved after ~$((30 + i * 5))s."
+          exit 0
+        fi
+        echo "[vault-dns] Not resolved yet (attempt $${i}/168), retrying in 5s..."
+        sleep 5
+      done
+      echo "[vault-dns] Timeout after 15 min waiting for vault DNS." >&2
+      exit 1
+    SH
+  }
+}
+
 resource "oci_kms_key" "openvidu_key" {
   count               = var.key_ocid == "" ? 1 : 0
   compartment_id      = var.compartment_ocid
@@ -457,7 +500,7 @@ resource "oci_kms_key" "openvidu_key" {
     length    = 32
   }
 
-  depends_on = [oci_kms_vault.openvidu_vault]
+  depends_on = [null_resource.wait_for_vault_dns]
 }
 
 data "oci_kms_key" "openvidu_key" {
@@ -681,7 +724,7 @@ EOF
 set -e
 
 # Generate URLs
-DOMAIN="$(oci secrets secret-bundle get --secret-id $(oci vault secret list --compartment-id ${var.compartment_ocid} --all --query "data[?\"secret-name\"=='DOMAIN_NAME'].id | [0]" --raw-output --auth instance_principal) --query 'data."secret-bundle-content".content' --raw-output --auth instance_principal | base64 -d)"
+DOMAIN="$(oci secrets secret-bundle get --secret-id $(oci vault secret list --compartment-id ${var.compartment_ocid} --vault-id ${var.vault_ocid != "" ? var.vault_ocid : oci_kms_vault.openvidu_vault[0].id} --all --query "data[?\"secret-name\"=='DOMAIN_NAME'].id | [0]" --raw-output --auth instance_principal) --query 'data."secret-bundle-content".content' --raw-output --auth instance_principal | base64 -d)"
 OPENVIDU_URL="https://$${DOMAIN}/"
 LIVEKIT_URL="wss://$${DOMAIN}/"
 DASHBOARD_URL="https://$${DOMAIN}/dashboard/"
@@ -707,7 +750,7 @@ CONFIG_DIR="$${INSTALL_DIR}/config"
 # Helper function to get secret value from OCI Vault
 get_secret() {
   local secret_name="$1"
-  local secret_id=$(oci vault secret list --compartment-id ${var.compartment_ocid} --all --query "data[?\"secret-name\"=='$secret_name'].id | [0]" --raw-output --auth instance_principal)
+  local secret_id=$(oci vault secret list --compartment-id ${var.compartment_ocid} --vault-id ${var.vault_ocid != "" ? var.vault_ocid : oci_kms_vault.openvidu_vault[0].id} --all --query "data[?\"secret-name\"=='$secret_name'].id | [0]" --raw-output --auth instance_principal)
   oci secrets secret-bundle get --secret-id "$secret_id" --query 'data."secret-bundle-content".content' --raw-output --auth instance_principal | base64 -d
 }
 
@@ -716,7 +759,7 @@ update_secret() {
   local secret_name="$1"
   local secret_value="$2"
   local secret_id
-  secret_id=$(oci vault secret list --compartment-id ${var.compartment_ocid} --all --query "data[?\"secret-name\"=='$secret_name' && \"lifecycle-state\"=='ACTIVE'].id | [0]" --raw-output --auth instance_principal)
+  secret_id=$(oci vault secret list --compartment-id ${var.compartment_ocid} --vault-id ${var.vault_ocid != "" ? var.vault_ocid : oci_kms_vault.openvidu_vault[0].id} --all --query "data[?\"secret-name\"=='$secret_name' && \"lifecycle-state\"=='ACTIVE'].id | [0]" --raw-output --auth instance_principal)
   if [[ -z "$secret_id" || "$secret_id" == "null" ]]; then
     echo "Secret $secret_name not found in vault" >&2
     return 1
@@ -805,7 +848,7 @@ update_secret() {
   local secret_name="$1"
   local secret_value="$2"
   local secret_id
-  secret_id=$(oci vault secret list --compartment-id ${var.compartment_ocid} --all --query "data[?\"secret-name\"=='$secret_name' && \"lifecycle-state\"=='ACTIVE'].id | [0]" --raw-output --auth instance_principal)
+  secret_id=$(oci vault secret list --compartment-id ${var.compartment_ocid} --vault-id ${var.vault_ocid != "" ? var.vault_ocid : oci_kms_vault.openvidu_vault[0].id} --all --query "data[?\"secret-name\"=='$secret_name' && \"lifecycle-state\"=='ACTIVE'].id | [0]" --raw-output --auth instance_principal)
   if [[ -z "$secret_id" || "$secret_id" == "null" ]]; then
     echo "Secret $secret_name not found in vault" >&2
     return 1
@@ -894,68 +937,93 @@ get_value "$key" "$file_path"
 EOF
 
   store_secret_script = <<-EOF
-#!/bin/bash -x
+#!/bin/bash
 set -e
 
-# Modes: save, generate
-# save mode: save the secret in the secret manager
-# generate mode: generate a random password and save it in the secret manager
-MODE="$1"
+export HOME="/root"
+export PATH="$PATH:$HOME/.local/bin"
 
-# Helper to create or update a secret in OCI Vault
+VAULT_ID="${var.vault_ocid != "" ? var.vault_ocid : oci_kms_vault.openvidu_vault[0].id}"
+KEY_ID="${var.key_ocid != "" ? var.key_ocid : oci_kms_key.openvidu_key[0].id}"
+COMPARTMENT_ID="${var.compartment_ocid}"
+
+# Helper: run an OCI CLI command with automatic retry on transient errors
+oci_with_retry() {
+  local max_attempts=5
+  local attempt=0
+  local delay=10
+  local stderr_file
+  stderr_file=$(mktemp)
+  while true; do
+    attempt=$((attempt + 1))
+    if output=$("$@" 2>"$stderr_file"); then
+      rm -f "$stderr_file"
+      echo "$output"
+      return 0
+    fi
+    if [[ $attempt -ge $max_attempts ]]; then
+      cat "$stderr_file" >&2
+      rm -f "$stderr_file"
+      return 1
+    fi
+    echo "[store_secret] OCI API call failed (attempt $attempt/$max_attempts), retrying in $${delay}s..." >&2
+    sleep "$delay"
+    delay=$((delay * 2))
+  done
+}
+
+# Helper: sanitize OCI CLI --raw-output when JMESPath returns no match.
+# OCI CLI prints "Query returned empty result, no output to show." to stdout
+# instead of an empty string when the query matches nothing.
+ocid_from_query() {
+  local result
+  result=$("$@")
+  if [[ "$result" == *"Query returned empty result"* || "$result" == "null" ]]; then
+    echo ""
+  else
+    echo "$result"
+  fi
+}
+
+# Helper: store or update a secret in OCI Vault via Instance Principal
 store_in_vault() {
   local secret_name="$1"
   local secret_value="$2"
   local encoded_value
   encoded_value=$(echo -n "$secret_value" | base64)
 
-  # Check if secret already exists and is ACTIVE
   local secret_id
-  secret_id=$(oci vault secret list \
-    --compartment-id ${var.compartment_ocid} \
+  secret_id=$(ocid_from_query oci_with_retry oci vault secret list \
+    --compartment-id "$COMPARTMENT_ID" \
+    --vault-id "$VAULT_ID" \
     --all \
-    --query "data[?\"secret-name\"=='$secret_name' && \"lifecycle-state\"=='ACTIVE'].id | [0]" \
+    --query "data[?\"secret-name\"=='$secret_name'].id | [0]" \
     --raw-output \
     --auth instance_principal)
 
-  if [[ -z "$secret_id" || "$secret_id" == "null" ]]; then
-    # Check if there's a pending-deletion secret to restore first
-    local pending_id
-    pending_id=$(oci vault secret list \
-      --compartment-id ${var.compartment_ocid} \
-      --all \
-      --query "data[?\"secret-name\"=='$secret_name' && (\"lifecycle-state\"=='PENDING_DELETION' || \"lifecycle-state\"=='SCHEDULED_FOR_DELETION')].id | [0]" \
-      --raw-output \
-      --auth instance_principal)
-
-    if [[ -n "$pending_id" && "$pending_id" != "null" ]]; then
-      # Restore secret from pending deletion, then update
-      oci vault secret cancel-secret-deletion --secret-id "$pending_id" --auth instance_principal > /dev/null
-      oci vault secret update-base64 \
-        --secret-id "$pending_id" \
-        --secret-content-content "$encoded_value" \
-        --enable-auto-generation false \
-        --auth instance_principal > /dev/null
-    else
-      # Create new secret
-      oci vault secret create-base64 \
-        --compartment-id ${var.compartment_ocid} \
-        --secret-name "$secret_name" \
-        --vault-id ${var.vault_ocid != "" ? var.vault_ocid : oci_kms_vault.openvidu_vault[0].id} \
-        --key-id ${var.key_ocid != "" ? var.key_ocid : oci_kms_key.openvidu_key[0].id} \
-        --secret-content-content "$encoded_value" \
-        --secret-content-name "$secret_name" \
-        --auth instance_principal > /dev/null
-    fi
+  if [[ -z "$secret_id" ]]; then
+    oci_with_retry oci vault secret create-base64 \
+      --compartment-id "$COMPARTMENT_ID" \
+      --secret-name "$secret_name" \
+      --vault-id "$VAULT_ID" \
+      --key-id "$KEY_ID" \
+      --secret-content-content "$encoded_value" \
+      --secret-content-name "$secret_name" \
+      --auth instance_principal > /dev/null
   else
-    # Update existing active secret
-    oci vault secret update-base64 \
+    oci vault secret cancel-secret-deletion \
+      --secret-id "$secret_id" \
+      --auth instance_principal > /dev/null 2>&1 || true
+    oci_with_retry oci vault secret update-base64 \
       --secret-id "$secret_id" \
       --secret-content-content "$encoded_value" \
       --enable-auto-generation false \
       --auth instance_principal > /dev/null
   fi
 }
+
+# Modes: save, generate
+MODE="$1"
 
 if [[ "$MODE" == "generate" ]]; then
   SECRET_KEY_NAME="$2"
@@ -985,10 +1053,17 @@ EOF
 
   check_app_ready_script = <<-EOF
 #!/bin/bash
+FAIL_COUNT=0
 while true; do
-  HTTP_STATUS=$(curl -Ik http://localhost:7880/health/caddy | head -n1 | awk '{print $2}')
-  if [ $HTTP_STATUS == 200 ]; then
+  HTTP_STATUS=$(curl -Ik http://localhost:7880/health/caddy 2>/dev/null | head -n1 | awk '{print $2}')
+  if [ "$HTTP_STATUS" == "200" ]; then
     break
+  fi
+  FAIL_COUNT=$((FAIL_COUNT + 1))
+  if [ $FAIL_COUNT -ge 10 ]; then
+    echo "[check_app_ready] $FAIL_COUNT consecutive failures, restarting openvidu..."
+    systemctl restart openvidu
+    FAIL_COUNT=0
   fi
   sleep 5
 done
@@ -1091,7 +1166,7 @@ apt-get update && apt-get install -y \
 
   # Install pipx and OCI CLI via pipx (The correct way for modern Linux)
   apt-get update && apt-get install -y pipx
-  OCI_CLI_VERSION="3.52.0"
+  OCI_CLI_VERSION="3.83.0"
   pipx install oci-cli==$${OCI_CLI_VERSION}
   
   # Add pipx bin directory to PATH so the 'oci' command is found
