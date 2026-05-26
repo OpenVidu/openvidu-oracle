@@ -108,372 +108,138 @@ resource "oci_core_network_security_group" "media_nsg" {
   display_name   = "${var.stackName}-media-nsg"
 }
 
-# NSG common egress
-resource "oci_core_network_security_group_security_rule" "master_nsg_egress" {
-  network_security_group_id = oci_core_network_security_group.master_nsg.id
+locals {
+  master_internet_ingress_tcp = {
+    ssh   = { min = 22, max = 22, label = "SSH" }
+    http  = { min = 80, max = 80, label = "HTTP" }
+    https = { min = 443, max = 443, label = "HTTPS" }
+    rtmp  = { min = 1935, max = 1935, label = "RTMP" }
+    minio = { min = 9000, max = 9000, label = "MinIO" }
+  }
+
+  media_internet_ingress_tcp = {
+    ssh     = { min = 22, max = 22, label = "SSH" }
+    livekit = { min = 7881, max = 7881, label = "TCP 7881" }
+    api     = { min = 7880, max = 7880, label = "TCP 7880" }
+    rtp     = { min = 50000, max = 60000, label = "TCP range" }
+  }
+
+  media_internet_ingress_udp = {
+    dtls = { min = 443, max = 443, label = "UDP 443" }
+    turn = { min = 7885, max = 7885, label = "UDP 7885" }
+    rtp  = { min = 50000, max = 60000, label = "UDP range" }
+  }
+
+  master_ingress_from_media_ports = {
+    livekit   = { min = 7000, max = 7000 }
+    metrics   = { min = 9100, max = 9100 }
+    openvidu  = { min = 20000, max = 20000 }
+    loki      = { min = 3100, max = 3100 }
+    tempo     = { min = 9009, max = 9009 }
+    rtc       = { min = 4443, max = 4443 }
+    media_api = { min = 9080, max = 9080 }
+    kurento   = { min = 6080, max = 6080 }
+  }
+
+  media_ingress_from_master_ports = {
+    rtmp    = { min = 1935, max = 1935 }
+    turn    = { min = 5349, max = 5349 }
+    livekit = { min = 7880, max = 7880 }
+    api     = { min = 8080, max = 8080 }
+  }
+}
+
+resource "oci_core_network_security_group_security_rule" "nsg_egress" {
+  for_each = {
+    master = oci_core_network_security_group.master_nsg.id
+    media  = oci_core_network_security_group.media_nsg.id
+  }
+  network_security_group_id = each.value
   direction                 = "EGRESS"
   destination               = "0.0.0.0/0"
   protocol                  = "all"
 }
 
-resource "oci_core_network_security_group_security_rule" "media_nsg_egress" {
-  network_security_group_id = oci_core_network_security_group.media_nsg.id
-  direction                 = "EGRESS"
-  destination               = "0.0.0.0/0"
-  protocol                  = "all"
-}
+resource "oci_core_network_security_group_security_rule" "master_internet_ingress" {
+  for_each = local.master_internet_ingress_tcp
 
-# Master ingress from Internet: 22, 80, 443, 1935, 9000
-resource "oci_core_network_security_group_security_rule" "master_ingress_ssh" {
   network_security_group_id = oci_core_network_security_group.master_nsg.id
   direction                 = "INGRESS"
   protocol                  = "6"
   source                    = "0.0.0.0/0"
+  description               = "Master ${each.value.label}"
   tcp_options {
     destination_port_range {
-      min = 22
-      max = 22
+      min = each.value.min
+      max = each.value.max
     }
   }
-  description = "Master SSH"
 }
 
-resource "oci_core_network_security_group_security_rule" "master_ingress_http" {
-  network_security_group_id = oci_core_network_security_group.master_nsg.id
-  direction                 = "INGRESS"
-  protocol                  = "6"
-  source                    = "0.0.0.0/0"
-  tcp_options {
-    destination_port_range {
-      min = 80
-      max = 80
-    }
-  }
-  description = "Master HTTP"
-}
+resource "oci_core_network_security_group_security_rule" "media_internet_ingress_tcp" {
+  for_each = local.media_internet_ingress_tcp
 
-resource "oci_core_network_security_group_security_rule" "master_ingress_https" {
-  network_security_group_id = oci_core_network_security_group.master_nsg.id
-  direction                 = "INGRESS"
-  protocol                  = "6"
-  source                    = "0.0.0.0/0"
-  tcp_options {
-    destination_port_range {
-      min = 443
-      max = 443
-    }
-  }
-  description = "Master HTTPS"
-}
-
-resource "oci_core_network_security_group_security_rule" "master_ingress_rtmp" {
-  network_security_group_id = oci_core_network_security_group.master_nsg.id
-  direction                 = "INGRESS"
-  protocol                  = "6"
-  source                    = "0.0.0.0/0"
-  tcp_options {
-    destination_port_range {
-      min = 1935
-      max = 1935
-    }
-  }
-  description = "Master RTMP"
-}
-
-resource "oci_core_network_security_group_security_rule" "master_ingress_minio" {
-  network_security_group_id = oci_core_network_security_group.master_nsg.id
-  direction                 = "INGRESS"
-  protocol                  = "6"
-  source                    = "0.0.0.0/0"
-  tcp_options {
-    destination_port_range {
-      min = 9000
-      max = 9000
-    }
-  }
-  description = "Master MinIO"
-}
-
-# Media ingress from Internet: TCP 22, 7881, 7880, 50000-60000
-resource "oci_core_network_security_group_security_rule" "media_ingress_ssh" {
   network_security_group_id = oci_core_network_security_group.media_nsg.id
   direction                 = "INGRESS"
   protocol                  = "6"
   source                    = "0.0.0.0/0"
+  description               = "Media ${each.value.label}"
   tcp_options {
     destination_port_range {
-      min = 22
-      max = 22
+      min = each.value.min
+      max = each.value.max
     }
   }
-  description = "Media SSH"
 }
 
-resource "oci_core_network_security_group_security_rule" "media_ingress_tcp_7881" {
-  network_security_group_id = oci_core_network_security_group.media_nsg.id
-  direction                 = "INGRESS"
-  protocol                  = "6"
-  source                    = "0.0.0.0/0"
-  tcp_options {
-    destination_port_range {
-      min = 7881
-      max = 7881
-    }
-  }
-  description = "Media TCP 7881"
-}
+resource "oci_core_network_security_group_security_rule" "media_internet_ingress_udp" {
+  for_each = local.media_internet_ingress_udp
 
-resource "oci_core_network_security_group_security_rule" "media_ingress_tcp_7880" {
-  network_security_group_id = oci_core_network_security_group.media_nsg.id
-  direction                 = "INGRESS"
-  protocol                  = "6"
-  source                    = "0.0.0.0/0"
-  tcp_options {
-    destination_port_range {
-      min = 7880
-      max = 7880
-    }
-  }
-  description = "Media TCP 7880"
-}
-
-resource "oci_core_network_security_group_security_rule" "media_ingress_tcp_range" {
-  network_security_group_id = oci_core_network_security_group.media_nsg.id
-  direction                 = "INGRESS"
-  protocol                  = "6"
-  source                    = "0.0.0.0/0"
-  tcp_options {
-    destination_port_range {
-      min = 50000
-      max = 60000
-    }
-  }
-  description = "Media TCP range"
-}
-
-# Media ingress from Internet: UDP 443, 7885, 50000-60000
-resource "oci_core_network_security_group_security_rule" "media_ingress_udp_443" {
   network_security_group_id = oci_core_network_security_group.media_nsg.id
   direction                 = "INGRESS"
   protocol                  = "17"
   source                    = "0.0.0.0/0"
+  description               = "Media ${each.value.label}"
   udp_options {
     destination_port_range {
-      min = 443
-      max = 443
+      min = each.value.min
+      max = each.value.max
     }
   }
-  description = "Media UDP 443"
 }
 
-resource "oci_core_network_security_group_security_rule" "media_ingress_udp_7885" {
-  network_security_group_id = oci_core_network_security_group.media_nsg.id
-  direction                 = "INGRESS"
-  protocol                  = "17"
-  source                    = "0.0.0.0/0"
-  udp_options {
-    destination_port_range {
-      min = 7885
-      max = 7885
-    }
-  }
-  description = "Media UDP 7885"
-}
+resource "oci_core_network_security_group_security_rule" "master_ingress_from_media" {
+  for_each = local.master_ingress_from_media_ports
 
-resource "oci_core_network_security_group_security_rule" "media_ingress_udp_range" {
-  network_security_group_id = oci_core_network_security_group.media_nsg.id
-  direction                 = "INGRESS"
-  protocol                  = "17"
-  source                    = "0.0.0.0/0"
-  udp_options {
-    destination_port_range {
-      min = 50000
-      max = 60000
-    }
-  }
-  description = "Media UDP range"
-}
-
-# Media -> Master (equivalent to GCP firewall_media_to_master)
-resource "oci_core_network_security_group_security_rule" "master_ingress_from_media_7000" {
   network_security_group_id = oci_core_network_security_group.master_nsg.id
   direction                 = "INGRESS"
   protocol                  = "6"
   source_type               = "NETWORK_SECURITY_GROUP"
   source                    = oci_core_network_security_group.media_nsg.id
+  description               = "Media to Master ${each.value.min}"
   tcp_options {
     destination_port_range {
-      min = 7000
-      max = 7000
+      min = each.value.min
+      max = each.value.max
     }
   }
-  description = "Media to Master 7000"
 }
 
-resource "oci_core_network_security_group_security_rule" "master_ingress_from_media_9100" {
-  network_security_group_id = oci_core_network_security_group.master_nsg.id
-  direction                 = "INGRESS"
-  protocol                  = "6"
-  source_type               = "NETWORK_SECURITY_GROUP"
-  source                    = oci_core_network_security_group.media_nsg.id
-  tcp_options {
-    destination_port_range {
-      min = 9100
-      max = 9100
-    }
-  }
-  description = "Media to Master 9100"
-}
+resource "oci_core_network_security_group_security_rule" "media_ingress_from_master" {
+  for_each = local.media_ingress_from_master_ports
 
-resource "oci_core_network_security_group_security_rule" "master_ingress_from_media_20000" {
-  network_security_group_id = oci_core_network_security_group.master_nsg.id
-  direction                 = "INGRESS"
-  protocol                  = "6"
-  source_type               = "NETWORK_SECURITY_GROUP"
-  source                    = oci_core_network_security_group.media_nsg.id
-  tcp_options {
-    destination_port_range {
-      min = 20000
-      max = 20000
-    }
-  }
-  description = "Media to Master 20000"
-}
-
-resource "oci_core_network_security_group_security_rule" "master_ingress_from_media_3100" {
-  network_security_group_id = oci_core_network_security_group.master_nsg.id
-  direction                 = "INGRESS"
-  protocol                  = "6"
-  source_type               = "NETWORK_SECURITY_GROUP"
-  source                    = oci_core_network_security_group.media_nsg.id
-  tcp_options {
-    destination_port_range {
-      min = 3100
-      max = 3100
-    }
-  }
-  description = "Media to Master 3100"
-}
-
-resource "oci_core_network_security_group_security_rule" "master_ingress_from_media_9009" {
-  network_security_group_id = oci_core_network_security_group.master_nsg.id
-  direction                 = "INGRESS"
-  protocol                  = "6"
-  source_type               = "NETWORK_SECURITY_GROUP"
-  source                    = oci_core_network_security_group.media_nsg.id
-  tcp_options {
-    destination_port_range {
-      min = 9009
-      max = 9009
-    }
-  }
-  description = "Media to Master 9009"
-}
-
-resource "oci_core_network_security_group_security_rule" "master_ingress_from_media_4443" {
-  network_security_group_id = oci_core_network_security_group.master_nsg.id
-  direction                 = "INGRESS"
-  protocol                  = "6"
-  source_type               = "NETWORK_SECURITY_GROUP"
-  source                    = oci_core_network_security_group.media_nsg.id
-  tcp_options {
-    destination_port_range {
-      min = 4443
-      max = 4443
-    }
-  }
-  description = "Media to Master 4443"
-}
-
-resource "oci_core_network_security_group_security_rule" "master_ingress_from_media_9080" {
-  network_security_group_id = oci_core_network_security_group.master_nsg.id
-  direction                 = "INGRESS"
-  protocol                  = "6"
-  source_type               = "NETWORK_SECURITY_GROUP"
-  source                    = oci_core_network_security_group.media_nsg.id
-  tcp_options {
-    destination_port_range {
-      min = 9080
-      max = 9080
-    }
-  }
-  description = "Media to Master 9080"
-}
-
-resource "oci_core_network_security_group_security_rule" "master_ingress_from_media_6080" {
-  network_security_group_id = oci_core_network_security_group.master_nsg.id
-  direction                 = "INGRESS"
-  protocol                  = "6"
-  source_type               = "NETWORK_SECURITY_GROUP"
-  source                    = oci_core_network_security_group.media_nsg.id
-  tcp_options {
-    destination_port_range {
-      min = 6080
-      max = 6080
-    }
-  }
-  description = "Media to Master 6080"
-}
-
-# Master -> Media (equivalent to GCP firewall_master_to_media)
-resource "oci_core_network_security_group_security_rule" "media_ingress_from_master_1935" {
   network_security_group_id = oci_core_network_security_group.media_nsg.id
   direction                 = "INGRESS"
   protocol                  = "6"
   source_type               = "NETWORK_SECURITY_GROUP"
   source                    = oci_core_network_security_group.master_nsg.id
+  description               = "Master to Media ${each.value.min}"
   tcp_options {
     destination_port_range {
-      min = 1935
-      max = 1935
+      min = each.value.min
+      max = each.value.max
     }
   }
-  description = "Master to Media 1935"
-}
-
-resource "oci_core_network_security_group_security_rule" "media_ingress_from_master_5349" {
-  network_security_group_id = oci_core_network_security_group.media_nsg.id
-  direction                 = "INGRESS"
-  protocol                  = "6"
-  source_type               = "NETWORK_SECURITY_GROUP"
-  source                    = oci_core_network_security_group.master_nsg.id
-  tcp_options {
-    destination_port_range {
-      min = 5349
-      max = 5349
-    }
-  }
-  description = "Master to Media 5349"
-}
-
-resource "oci_core_network_security_group_security_rule" "media_ingress_from_master_7880" {
-  network_security_group_id = oci_core_network_security_group.media_nsg.id
-  direction                 = "INGRESS"
-  protocol                  = "6"
-  source_type               = "NETWORK_SECURITY_GROUP"
-  source                    = oci_core_network_security_group.master_nsg.id
-  tcp_options {
-    destination_port_range {
-      min = 7880
-      max = 7880
-    }
-  }
-  description = "Master to Media 7880"
-}
-
-resource "oci_core_network_security_group_security_rule" "media_ingress_from_master_8080" {
-  network_security_group_id = oci_core_network_security_group.media_nsg.id
-  direction                 = "INGRESS"
-  protocol                  = "6"
-  source_type               = "NETWORK_SECURITY_GROUP"
-  source                    = oci_core_network_security_group.master_nsg.id
-  tcp_options {
-    destination_port_range {
-      min = 8080
-      max = 8080
-    }
-  }
-  description = "Master to Media 8080"
 }
 
 # Subnet
@@ -530,6 +296,33 @@ data "oci_kms_vault" "openvidu_vault" {
   vault_id = var.vault_ocid != "" ? var.vault_ocid : oci_kms_vault.openvidu_vault[0].id
 }
 
+# OCI marks the vault ACTIVE before its management endpoint DNS is resolvable.
+# Wait until the hostname resolves before creating the key.
+resource "null_resource" "wait_for_vault_dns" {
+  count = var.vault_ocid == "" ? 1 : 0
+  triggers = {
+    vault_id = oci_kms_vault.openvidu_vault[0].id
+  }
+  depends_on = [oci_kms_vault.openvidu_vault]
+  provisioner "local-exec" {
+    command = <<-SH
+      HOST=$(echo "${data.oci_kms_vault.openvidu_vault.management_endpoint}" | sed 's|https://||' | sed 's|/.*||')
+      echo "[vault-dns] Waiting for $HOST to resolve (up to 15 min)..."
+      sleep 30
+      for i in $(seq 1 168); do
+        if getent hosts "$HOST" > /dev/null 2>&1 || host "$HOST" > /dev/null 2>&1 || nslookup "$HOST" > /dev/null 2>&1; then
+          echo "[vault-dns] Resolved after ~$((30 + i * 5))s."
+          exit 0
+        fi
+        echo "[vault-dns] Not resolved yet (attempt $${i}/168), retrying in 5s..."
+        sleep 5
+      done
+      echo "[vault-dns] Timeout after 15 min waiting for vault DNS." >&2
+      exit 1
+    SH
+  }
+}
+
 resource "oci_kms_key" "openvidu_key" {
   count               = var.key_ocid == "" ? 1 : 0
   compartment_id      = var.compartment_ocid
@@ -541,7 +334,7 @@ resource "oci_kms_key" "openvidu_key" {
     length    = 32
   }
 
-  depends_on = [oci_kms_vault.openvidu_vault]
+  depends_on = [null_resource.wait_for_vault_dns]
 }
 
 data "oci_kms_key" "openvidu_key" {
@@ -585,6 +378,8 @@ resource "oci_core_instance" "openvidu_master_node" {
     "stack"     = var.stackName
     "node-type" = "master"
   }
+
+  depends_on = [time_sleep.wait_for_iam_propagation]
 }
 
 # ------------------------- Autoscaling (Media Nodes) -------------------------
@@ -630,6 +425,147 @@ resource "oci_core_instance_configuration" "media_node_config" {
         "node-type" = "media"
       }
     }
+  }
+}
+
+# Cleanup orphaned media nodes on `terraform destroy`.
+#
+# Instances detached from the pool by the scale-in function (is_auto_terminate=false)
+# are no longer tracked by Terraform. If graceful_shutdown.sh fails to self-terminate
+# one of them it would stay alive forever.
+#
+# Destroy order (null_resource depends_on pool):
+#   1. THIS provisioner runs first → terminates detached/orphaned media nodes
+#   2. instance pool destroyed → OCI terminates its current members
+#
+# Identification: every media node is created with freeform tags
+#   stack=<stackName>  node-type=media  (set in media_node_config launch_details).
+resource "null_resource" "cleanup_orphaned_media_nodes" {
+  triggers = {
+    compartment_id = var.compartment_ocid
+    stack_name     = var.stackName
+  }
+
+  # depends_on subnet so that on destroy this runs BEFORE the subnet is deleted,
+  # ensuring orphaned instances (outside the pool) are terminated first.
+  depends_on = [oci_core_subnet.openvidu_subnet]
+
+  provisioner "local-exec" {
+    when = destroy
+    # No `environment` block on purpose: the provisioner inherits the PATH of
+    # the shell that invoked `terraform destroy`, so wherever the user has the
+    # OCI CLI (pipx ~/.local/bin, system /usr/local/bin, brew, etc.) it just
+    # works without us guessing.
+    command = <<-SCRIPT
+      set -x
+      if ! command -v oci >/dev/null 2>&1; then
+        echo "[cleanup] WARN: 'oci' CLI not found in PATH ($PATH); skipping orphan cleanup."
+        echo "[cleanup] If any media nodes detached from the pool are still RUNNING in OCI,"
+        echo "[cleanup] terminate them manually before re-deploying or they will accumulate."
+        exit 0
+      fi
+      echo "[cleanup] Looking for orphaned media nodes (stack=${self.triggers.stack_name})..."
+      # NOTE: single-dollar shell vars are correct here. Terraform only treats
+      # double-dollar followed by an open-brace as an escape. A bare $$VAR
+      # passes through literally and breaks both jq (invalid syntax) and shell
+      # (where $$ alone expands to the PID).
+
+      # All non-terminated media instances of this stack
+      ALL_IDS=$(oci compute instance list \
+        --compartment-id "${self.triggers.compartment_id}" \
+        --all --output json \
+        | jq -r --arg s "${self.triggers.stack_name}" \
+            '.data[]
+             | select(
+                 .["lifecycle-state"] != "TERMINATED" and
+                 .["lifecycle-state"] != "TERMINATING" and
+                 .["freeform-tags"]["stack"] == $s and
+                 .["freeform-tags"]["node-type"] == "media"
+               )
+             | .id') || { echo "[cleanup] ERROR: failed to list instances"; exit 0; }
+
+      # Pool members (if the pool still exists at this point). The pool's own
+      # destroy will terminate its members — we ONLY want to kill instances
+      # that detached and got stuck (true orphans).
+      POOL_ID=$(oci compute-management instance-pool list \
+        --compartment-id "${self.triggers.compartment_id}" \
+        --all --output json 2>/dev/null \
+        | jq -r --arg n "${self.triggers.stack_name}-media-pool" \
+            '.data[] | select(."display-name" == $n and ."lifecycle-state" != "TERMINATED") | .id' \
+        | head -1) || POOL_ID=""
+
+      MEMBER_IDS=""
+      if [ -n "$POOL_ID" ]; then
+        MEMBER_IDS=$(oci compute-management instance-pool list-instances \
+          --compartment-id "${self.triggers.compartment_id}" \
+          --instance-pool-id "$POOL_ID" \
+          --all --output json 2>/dev/null \
+          | jq -r '.data[].id') || MEMBER_IDS=""
+      fi
+
+      # Orphans = ALL_IDS - MEMBER_IDS. Plain POSIX, no bashisms — local-exec
+      # uses /bin/sh which on Ubuntu is dash (no process substitution).
+      IDS=""
+      for id in $ALL_IDS; do
+        case "$MEMBER_IDS" in
+          *"$id"*) ;;
+          *) IDS="$IDS $id" ;;
+        esac
+      done
+
+      if [ -z "$IDS" ]; then
+        echo "[cleanup] No orphaned media nodes found."
+      else
+        for ID in $IDS; do
+          echo "[cleanup] Terminating orphaned media node $ID..."
+          oci compute instance terminate \
+            --instance-id "$ID" \
+            --preserve-boot-volume true \
+            --force || true
+        done
+        echo "[cleanup] Waiting for instances to reach TERMINATED state..."
+        for ID in $IDS; do
+          attempt=0
+          while true; do
+            attempt=$((attempt + 1))
+            STATE=$(oci compute instance get --instance-id "$ID" --query 'data."lifecycle-state"' --raw-output 2>/dev/null || echo "TERMINATED")
+            echo "[cleanup] $ID state: $STATE (attempt $attempt)"
+            if [ "$STATE" = "TERMINATED" ]; then break; fi
+            if [ $attempt -ge 60 ]; then echo "[cleanup] Timeout waiting for $ID"; break; fi
+            sleep 10
+          done
+        done
+        # Detaching BVs need a moment to settle into AVAILABLE before listing.
+        sleep 15
+      fi
+
+      echo "[cleanup] Looking for orphaned boot volumes (stack=${self.triggers.stack_name})..."
+      # BVs are named after their parent instance (inst-XXXXX-STACK-media-
+      # pool), NOT the pool itself. startswith() never matched these — use
+      # contains(). The AVAILABLE filter guarantees we never touch BVs that
+      # are still attached to a running instance.
+      BVIDS=$(oci bv boot-volume list \
+        --compartment-id "${self.triggers.compartment_id}" \
+        --all --output json \
+        | jq -r --arg s "${self.triggers.stack_name}-media-pool" \
+            '.data[]
+             | select(
+                 .["lifecycle-state"] == "AVAILABLE" and
+                 (.["display-name"] | contains($s))
+               )
+             | .id') || true
+      if [ -z "$BVIDS" ]; then
+        echo "[cleanup] No orphaned boot volumes found."
+      else
+        for BVID in $BVIDS; do
+          echo "[cleanup] Deleting orphaned boot volume $BVID..."
+          oci bv boot-volume delete \
+            --boot-volume-id "$BVID" \
+            --force || true
+        done
+      fi
+      echo "[cleanup] Done."
+    SCRIPT
   }
 }
 
@@ -681,8 +617,7 @@ resource "oci_autoscaling_auto_scaling_configuration" "media_node_autoscaling" {
     # OCI provider ≥8.12.0 requires at least one scale-in rule in the policy.
     # Threshold LT 0% is mathematically impossible — CPU utilisation is always ≥ 0.
     # This rule exists ONLY to satisfy the provider; it will NEVER fire.
-    # All scale-in is owned by the session-aware pre-drain daemon, which checks
-    # for active LiveKit rooms and only drains nodes with zero meetings.
+    # All scale-in is owned by the OCI Function (func.py), invoked every 5 min.
     rules {
       action {
         type  = "CHANGE_COUNT_BY"
@@ -712,25 +647,127 @@ resource "oci_identity_dynamic_group" "openvidu_instances_dg" {
   matching_rule  = "instance.compartment.id = '${var.compartment_ocid}'"
 }
 
-# Policy: allows media nodes to discover their pool, detach themselves (scale-in),
-# and self-terminate after drain — the OCI equivalent of GCP's remove-from-MIG + self-delete.
-# 'manage instance-pools' covers list + get + detach-instance operations.
-# 'manage instances' covers list-instances (pool members) + instance terminate.
-# Note: 'manage instances' implies 'read instances' — the read statement is omitted.
+# Policy: allows instances to poll pool membership (pre-drain daemon), self-terminate
+# after drain (graceful_shutdown.sh), manage vault secrets, and invoke the scale-in
+# function (master node).
 resource "oci_identity_policy" "media_node_predrain_policy" {
-  compartment_id = var.compartment_ocid
+  # Must be at tenancy (root) level so that cross-compartment grants work
+  # when the vault lives in a different compartment than the deployment.
+  compartment_id = var.tenancy_ocid
   name           = "${var.stackName}-predrain-policy"
-  description    = "Allow OpenVidu media nodes to manage their own lifecycle for graceful drain"
+  description    = "Allow OpenVidu instances to manage their lifecycle and invoke the scale-in function"
   statements = [
     "allow dynamic-group ${oci_identity_dynamic_group.openvidu_instances_dg.name} to manage instance-pools in compartment id ${var.compartment_ocid}",
     "allow dynamic-group ${oci_identity_dynamic_group.openvidu_instances_dg.name} to manage instances in compartment id ${var.compartment_ocid}",
+    "allow dynamic-group ${oci_identity_dynamic_group.openvidu_instances_dg.name} to {INSTANCE_INSPECT,INSTANCE_READ,INSTANCE_UPDATE,INSTANCE_DELETE} in compartment id ${var.compartment_ocid}",
+    "allow dynamic-group ${oci_identity_dynamic_group.openvidu_instances_dg.name} to manage boot-volumes in compartment id ${var.compartment_ocid}",
+    # use vnics + use subnets required for OCI to detach the VNIC when terminating an instance
+    "allow dynamic-group ${oci_identity_dynamic_group.openvidu_instances_dg.name} to use vnics in compartment id ${var.compartment_ocid}",
+    "allow dynamic-group ${oci_identity_dynamic_group.openvidu_instances_dg.name} to use subnets in compartment id ${var.compartment_ocid}",
     "allow dynamic-group ${oci_identity_dynamic_group.openvidu_instances_dg.name} to manage secret-family in compartment id ${var.compartment_ocid}",
-    "allow dynamic-group ${oci_identity_dynamic_group.openvidu_instances_dg.name} to use vaults in compartment id ${var.compartment_ocid}",
-    "allow dynamic-group ${oci_identity_dynamic_group.openvidu_instances_dg.name} to use keys in compartment id ${var.compartment_ocid}",
+    "allow dynamic-group ${oci_identity_dynamic_group.openvidu_instances_dg.name} to read secret-bundles in compartment id ${var.compartment_ocid}",
+    "allow dynamic-group ${oci_identity_dynamic_group.openvidu_instances_dg.name} to read metrics in compartment id ${var.compartment_ocid}",
+    # Vault and key may be in a different compartment — use the vault's actual compartment
+    "allow dynamic-group ${oci_identity_dynamic_group.openvidu_instances_dg.name} to use vaults in compartment id ${data.oci_kms_vault.openvidu_vault.compartment_id}",
+    "allow dynamic-group ${oci_identity_dynamic_group.openvidu_instances_dg.name} to use keys in compartment id ${data.oci_kms_vault.openvidu_vault.compartment_id}",
+    "allow dynamic-group ${oci_identity_dynamic_group.openvidu_instances_dg.name} to use fn-invocation in compartment id ${var.compartment_ocid}",
+    "allow dynamic-group ${oci_identity_dynamic_group.openvidu_instances_dg.name} to use fn-function in compartment id ${var.compartment_ocid}",
   ]
 }
 
-# ------------------------- Locals & User Data -------------------------
+# ------------------------- OCI Functions: Scale-in -------------------------
+
+# Dynamic Group: matches the scale-in function for Resource Principal auth.
+# Required so the function can call OCI APIs (instance-pools, monitoring)
+# without embedding credentials in the image.
+resource "oci_identity_dynamic_group" "scale_in_fn_dg" {
+  compartment_id = var.tenancy_ocid
+  name           = "${var.stackName}-scalein-fn-dg"
+  description    = "Dynamic group for OpenVidu scale-in OCI Function (Resource Principal auth)"
+  matching_rule  = "ALL {resource.type='fnfunc', resource.compartment.id='${var.compartment_ocid}'}"
+}
+
+# Policy: allows the scale-in function to list/inspect/resize the media node pool
+# and to read CPU metrics from OCI Monitoring (same data source as func.py).
+resource "oci_identity_policy" "scale_in_fn_policy" {
+  compartment_id = var.compartment_ocid
+  name           = "${var.stackName}-scalein-fn-policy"
+  description    = "Allow OpenVidu scale-in OCI Function to manage media node pool size"
+  statements = [
+    "allow dynamic-group ${oci_identity_dynamic_group.scale_in_fn_dg.name} to manage instance-pools in compartment id ${var.compartment_ocid}",
+    "allow dynamic-group ${oci_identity_dynamic_group.scale_in_fn_dg.name} to manage instances in compartment id ${var.compartment_ocid}",
+    # terminate-instance with preserve_boot_volume=false must delete the boot
+    # volume too — without volume-family OCI rejects with "volume ... cannot
+    # be terminated because this user does not have sufficient permissions".
+    "allow dynamic-group ${oci_identity_dynamic_group.scale_in_fn_dg.name} to manage volume-family in compartment id ${var.compartment_ocid}",
+    "allow dynamic-group ${oci_identity_dynamic_group.scale_in_fn_dg.name} to read metrics in compartment id ${var.compartment_ocid}",
+  ]
+}
+
+# OCI IAM policy propagation can take 60-120 s after creation/recreation.
+# Wait before launching the master node so instance_principal auth is ready.
+resource "time_sleep" "wait_for_iam_propagation" {
+  depends_on = [
+    oci_identity_dynamic_group.openvidu_instances_dg,
+    oci_identity_policy.media_node_predrain_policy,
+  ]
+  create_duration = "120s"
+}
+
+# Function Application: hosts the scale-in function and injects runtime config.
+# The config vars are updated by Terraform; the function reads them at invocation
+# time via os.environ — no image rebuild needed to change them.
+resource "oci_functions_application" "scale_in_app" {
+  compartment_id = var.compartment_ocid
+  display_name   = "${var.stackName}-scalein-app"
+  subnet_ids     = [oci_core_subnet.openvidu_subnet.id]
+
+  config = {
+    COMPARTMENT_ID    = var.compartment_ocid
+    POOL_DISPLAY_NAME = "${var.stackName}-media-pool"
+    MIN_NODES         = tostring(var.minNumberOfMediaNodes)
+    CPU_THRESHOLD     = tostring(var.scaleTargetCPU)
+  }
+}
+
+# Function: uses the pre-built image published by OpenVidu Team in their OCIR
+# (Option B). No docker build/push during terraform apply.
+resource "oci_functions_function" "scale_in_fn" {
+  application_id     = oci_functions_application.scale_in_app.id
+  display_name       = "${var.stackName}-scalein-fn"
+  image              = var.scale_in_function_image
+  memory_in_mbs      = "256"
+  timeout_in_seconds = 120
+}
+
+# Log Group: container for the scale-in function logs.
+resource "oci_logging_log_group" "scale_in_log_group" {
+  compartment_id = var.compartment_ocid
+  display_name   = "${var.stackName}-scalein-log-group"
+}
+
+# Log: captures function invocation logs (stdout/stderr from func.py).
+# service=functions, resource=application OCID, category=invoke
+resource "oci_logging_log" "scale_in_fn_log" {
+  display_name = "${var.stackName}-scalein-fn-log"
+  log_group_id = oci_logging_log_group.scale_in_log_group.id
+  log_type     = "SERVICE"
+
+  configuration {
+    source {
+      category    = "invoke"
+      resource    = oci_functions_application.scale_in_app.id
+      service     = "functions"
+      source_type = "OCISERVICE"
+    }
+    compartment_id = var.compartment_ocid
+  }
+
+  is_enabled         = true
+  retention_duration = 30
+}
+
+
 
 locals {
   domain_name = var.domainName != "" ? var.domainName : "openvidu-${replace(oci_core_instance.openvidu_master_node.public_ip, ".", "-")}.sslip.io"
@@ -741,20 +778,168 @@ locals {
   yq_arch         = local.is_arm_instance ? "arm64" : "amd64"
   yq_sha256       = local.is_arm_instance ? "10a4a2093090363a00b55ad52e132a082f9652970cb8f1ad35a1ae048b917e6e" : "3fa3c1c32d94520102ea4d853d03c3ab907867d964540e896410ad8a7fc6c8f7"
 
-  # Pre-drain daemon: session-aware scale-in for OpenVidu media nodes.
-  # Queries the local LiveKit API for active rooms — only scales in nodes with
-  # ZERO active meetings. CPU is used as a secondary signal only.
-  # When conditions are met and this is the oldest instance in the pool, the daemon
-  # detaches itself (pool target decrements by 1, no replacement spawned), sends
-  # SIGQUIT to stop accepting new sessions, waits for any remaining sessions to end
-  # (no time constraint), then self-terminates via the OCI API.
-  # The instance is fully decoupled from the autoscaler before drain starts,
-  # so OCI's 15-min ACPI timeout never applies.
+  # Common OCI Vault helpers, sourced by store_secret / update_config_from_secret /
+  # update_secret_from_config. Keeps a single source of truth for retry, query
+  # sanitization, and read/write logic against the vault.
+  oci_helpers_script = <<-EOF
+#!/bin/bash
+# Common OCI Vault helpers. Sourced by store_secret.sh, update_config_from_secret.sh,
+# and update_secret_from_config.sh. Callers must set VAULT_ID and COMPARTMENT_ID
+# before sourcing; KEY_ID is required only when creating new secrets via
+# store_in_vault.
+#
+# We own retry instead of relying on the OCI CLI default: the default strategy
+# can spin internally for ~10 min on 429/5xx and stack under our own retry,
+# producing 20-30 min hangs during install.
+
+# Per-attempt wall-clock cap. Vault ops typically finish in <5s; longer means
+# the API or auth layer is wedged — kill and let oci_with_retry decide.
+: "$${OCI_CALL_TIMEOUT:=45}"
+
+oci_with_retry() {
+  local max_attempts=3
+  local attempt=0
+  local delay=5
+  local stderr_file
+  stderr_file=$(mktemp)
+  while true; do
+    attempt=$((attempt + 1))
+    if output=$(timeout "$OCI_CALL_TIMEOUT" "$@" 2>"$stderr_file"); then
+      rm -f "$stderr_file"
+      echo "$output"
+      return 0
+    fi
+    if [[ $attempt -ge $max_attempts ]]; then
+      cat "$stderr_file" >&2
+      rm -f "$stderr_file"
+      return 1
+    fi
+    echo "[oci-helpers] OCI API call failed (attempt $attempt/$max_attempts), retrying in $${delay}s..." >&2
+    sleep "$delay"
+    delay=$((delay * 2))
+  done
+}
+
+# OCI CLI --raw-output prints "Query returned empty result, no output to show."
+# to stdout instead of an empty string when JMESPath matches nothing. Filter
+# that so callers can test with [[ -z ]].
+ocid_from_query() {
+  local result
+  result=$("$@")
+  if [[ "$result" == *"Query returned empty result"* || "$result" == "null" ]]; then
+    echo ""
+  else
+    echo "$result"
+  fi
+}
+
+# Read an ACTIVE secret by name. Decoded value goes to stdout; returns non-zero
+# if not found (so callers using `$(get_from_vault X)` see empty + nonzero).
+get_from_vault() {
+  local secret_name="$1"
+  local secret_id
+  secret_id=$(ocid_from_query oci_with_retry oci vault secret list \
+    --compartment-id "$COMPARTMENT_ID" \
+    --vault-id "$VAULT_ID" \
+    --all \
+    --query "data[?\"secret-name\"=='$secret_name' && \"lifecycle-state\"=='ACTIVE'].id | [0]" \
+    --raw-output \
+    --auth instance_principal)
+  if [[ -z "$secret_id" ]]; then
+    echo "[oci-helpers] Secret '$secret_name' not found in vault" >&2
+    return 1
+  fi
+  oci_with_retry oci secrets secret-bundle get \
+    --secret-id "$secret_id" \
+    --query 'data."secret-bundle-content".content' \
+    --raw-output \
+    --auth instance_principal | base64 -d
+}
+
+# Store or update a secret in the vault.
+# Fast path: ACTIVE → update. Avoids cancel-secret-deletion on every call so we
+# stay below the 30/min vault rate limit. PENDING_DELETION fallback recovers
+# from manual schedule-deletion or external tooling. Create requires KEY_ID.
+store_in_vault() {
+  local secret_name="$1"
+  local secret_value="$2"
+  local encoded_value
+  encoded_value=$(echo -n "$secret_value" | base64)
+
+  local secret_id
+
+  secret_id=$(ocid_from_query oci_with_retry oci vault secret list \
+    --compartment-id "$COMPARTMENT_ID" \
+    --vault-id "$VAULT_ID" \
+    --all \
+    --query "data[?\"secret-name\"=='$secret_name' && \"lifecycle-state\"=='ACTIVE'].id | [0]" \
+    --raw-output \
+    --auth instance_principal)
+
+  if [[ -n "$secret_id" ]]; then
+    oci_with_retry oci vault secret update-base64 \
+      --secret-id "$secret_id" \
+      --secret-content-content "$encoded_value" \
+      --enable-auto-generation false \
+      --auth instance_principal > /dev/null
+    return
+  fi
+
+  # PENDING_DELETION fallback — cancel and wait for ACTIVE; otherwise update
+  # races against CANCELLING_DELETION and OCI returns 409.
+  secret_id=$(ocid_from_query oci_with_retry oci vault secret list \
+    --compartment-id "$COMPARTMENT_ID" \
+    --vault-id "$VAULT_ID" \
+    --all \
+    --query "data[?\"secret-name\"=='$secret_name' && \"lifecycle-state\"=='PENDING_DELETION'].id | [0]" \
+    --raw-output \
+    --auth instance_principal)
+
+  if [[ -n "$secret_id" ]]; then
+    oci_with_retry oci vault secret cancel-secret-deletion \
+      --secret-id "$secret_id" \
+      --auth instance_principal > /dev/null
+    local i state=""
+    for i in $(seq 1 30); do
+      state=$(oci_with_retry oci vault secret get \
+        --secret-id "$secret_id" \
+        --query 'data."lifecycle-state"' \
+        --raw-output \
+        --auth instance_principal 2>/dev/null || echo "")
+      [[ "$state" == "ACTIVE" ]] && break
+      sleep 2
+    done
+    oci_with_retry oci vault secret update-base64 \
+      --secret-id "$secret_id" \
+      --secret-content-content "$encoded_value" \
+      --enable-auto-generation false \
+      --auth instance_principal > /dev/null
+    return
+  fi
+
+  if [[ -z "$${KEY_ID:-}" ]]; then
+    echo "[oci-helpers] Cannot create '$secret_name': KEY_ID not set" >&2
+    return 1
+  fi
+  oci_with_retry oci vault secret create-base64 \
+    --compartment-id "$COMPARTMENT_ID" \
+    --secret-name "$secret_name" \
+    --vault-id "$VAULT_ID" \
+    --key-id "$KEY_ID" \
+    --secret-content-content "$encoded_value" \
+    --secret-content-name "$secret_name" \
+    --auth instance_principal > /dev/null
+}
+EOF
+
+  # Pre-drain daemon: polls pool membership every 30s. When this instance is
+  # no longer in the pool (detached by func.py on scale-in), calls graceful_shutdown.sh.
   pre_drain_daemon_script = <<-EOF
 #!/bin/bash
-# OpenVidu Pre-drain Daemon for OCI (session-aware)
-# Strategy: check active rooms -> sustained idle detection -> SIGQUIT -> detach -> wait -> self-terminate
-# NEVER scales in a node that has active meetings/rooms.
+# OpenVidu Pre-drain Daemon for OCI
+# Responsibility: detect that this instance has been detached from the pool
+# (by the scale-in OCI Function) and call graceful_shutdown.sh.
+# Scale-in decisions are owned by func.py — this daemon only reacts to them.
 
 source /etc/openvidu/predrain.conf
 
@@ -762,127 +947,27 @@ source /etc/openvidu/predrain.conf
 export HOME="/root"
 export PATH="$PATH:/root/.local/bin"
 
-DRAIN_LOCK="/var/run/openvidu-drain.lock"
-
 log() { echo "[openvidu-predrain $(date -u '+%Y-%m-%dT%H:%M:%SZ')] $*" >&2; }
 
 # If drain lock exists, daemon restarted mid-drain — wait for self-termination to complete
-if [ -f "$DRAIN_LOCK" ]; then
+if [ -f "/var/run/openvidu-drain.lock" ]; then
     log "Drain lock exists — drain already in progress. Waiting for self-termination."
     while true; do sleep 60; done
 fi
-
-# Accurate CPU usage via /proc/stat 2-second delta.
-# /proc/loadavg is NOT a CPU percentage — it is a queue length and can exceed 100.
-get_cpu_usage() {
-    read -ra s1 < <(grep '^cpu ' /proc/stat)
-    sleep 2
-    read -ra s2 < <(grep '^cpu ' /proc/stat)
-    local t1=$(( s1[1]+s1[2]+s1[3]+s1[4]+s1[5]+s1[6]+s1[7] ))
-    local i1=$${s1[4]}
-    local t2=$(( s2[1]+s2[2]+s2[3]+s2[4]+s2[5]+s2[6]+s2[7] ))
-    local i2=$${s2[4]}
-    awk "BEGIN { printf \"%d\", (1 - ($i2-$i1)/($t2-$t1)) * 100 }"
-}
-
-# Retry with exponential backoff (max 5 attempts).
-# Captures output internally — partial stdout from failed attempts never
-# contaminates the JSON result captured by the caller's $(...).
-oci_call() {
-    local attempt=0 delay=5 _out
-    while true; do
-        if _out=$("$@" 2>/dev/null); then
-            printf '%s' "$_out"
-            return 0
-        fi
-        attempt=$(( attempt + 1 ))
-        [ "$attempt" -ge 5 ] && { log "OCI call failed after 5 attempts."; return 1; }
-        log "OCI call failed (attempt $attempt/5). Retrying in $${delay}s..."
-        sleep "$delay"
-        delay=$(( delay * 2 ))
-    done
-}
-
-# Generate a LiveKit-compatible JWT (HS256) for RoomService/ListRooms.
-# Uses only openssl (always present) — no external JWT tool needed.
-generate_livekit_jwt() {
-    local api_key="$1" api_secret="$2"
-    local header payload signature now exp
-
-    header=$(printf '{"alg":"HS256","typ":"JWT"}' | openssl base64 -A | tr '+/' '-_' | tr -d '=')
-    now=$(date +%s)
-    exp=$(( now + 600 ))
-    payload=$(printf '{"iss":"%s","sub":"%s","iat":%d,"exp":%d,"video":{"roomList":true}}' \
-        "$api_key" "$api_key" "$now" "$exp" \
-        | openssl base64 -A | tr '+/' '-_' | tr -d '=')
-    signature=$(printf '%s.%s' "$header" "$payload" \
-        | openssl dgst -sha256 -hmac "$api_secret" -binary \
-        | openssl base64 -A | tr '+/' '-_' | tr -d '=')
-
-    printf '%s.%s.%s' "$header" "$payload" "$signature"
-}
-
-# Query the local LiveKit server for the number of active rooms.
-# Returns the room count, or -1 on error (API unreachable, auth failure, etc.).
-get_active_rooms() {
-    local jwt response room_count
-    jwt=$(generate_livekit_jwt "$LIVEKIT_API_KEY" "$LIVEKIT_API_SECRET")
-    response=$(curl -sf -m 10 \
-        -H "Authorization: Bearer $jwt" \
-        -H "Content-Type: application/json" \
-        -d '{}' \
-        "http://localhost:7880/twirp/livekit.RoomService/ListRooms" 2>/dev/null) || { echo "-1"; return 1; }
-    room_count=$(echo "$response" | jq '.rooms | length' 2>/dev/null) || { echo "-1"; return 1; }
-    echo "$room_count"
-}
-
-# Read a secret value from OCI Vault via Instance Principal
-get_secret() {
-    local secret_name="$1"
-    local secret_id
-    secret_id=$(oci vault secret list \
-        --compartment-id "$COMPARTMENT_ID" \
-        --all \
-        --query "data[?\"secret-name\"=='$secret_name' && \"lifecycle-state\"=='ACTIVE'].id | [0]" \
-        --raw-output \
-        --auth instance_principal 2>/dev/null) || return 1
-    [ -z "$secret_id" ] && return 1
-    oci secrets secret-bundle get \
-        --secret-id "$secret_id" \
-        --query 'data."secret-bundle-content".content' \
-        --raw-output \
-        --auth instance_principal 2>/dev/null | base64 -d
-}
 
 INSTANCE_OCID=$(curl -sf -H "Authorization: Bearer Oracle" \
     "http://169.254.169.254/opc/v2/instance/" | jq -r '.id')
 log "Started. Instance: $INSTANCE_OCID"
 
-# Fetch LiveKit API credentials from OCI Vault — needed to check active rooms
-log "Fetching LiveKit API credentials from vault..."
-LIVEKIT_API_KEY=""
-LIVEKIT_API_SECRET=""
-while [ -z "$LIVEKIT_API_KEY" ] || [ -z "$LIVEKIT_API_SECRET" ]; do
-    LIVEKIT_API_KEY=$(get_secret LIVEKIT_API_KEY 2>/dev/null) || true
-    LIVEKIT_API_SECRET=$(get_secret LIVEKIT_API_SECRET 2>/dev/null) || true
-    if [ -z "$LIVEKIT_API_KEY" ] || [ -z "$LIVEKIT_API_SECRET" ]; then
-        log "Waiting for LiveKit credentials in vault..."
-        sleep 30
-    fi
-done
-log "LiveKit API credentials loaded."
-
-# Discover pool OCID at runtime via exact display-name match.
-# Cannot embed pool OCID at Terraform time: instance_configuration -> user_data -> pool_id
-# -> instance_pool -> instance_configuration would be a circular dependency.
+# Discover pool OCID once at startup via exact display-name match.
 POOL_ID=""
 while [ -z "$POOL_ID" ]; do
-    POOL_ID=$(oci_call oci compute-management instance-pool list \
+    POOL_ID=$(oci compute-management instance-pool list \
         --compartment-id "$COMPARTMENT_ID" \
         --lifecycle-state RUNNING \
         --auth instance_principal \
         --all \
-        --output json \
+        --output json 2>/dev/null \
         | jq -r --arg n "$POOL_DISPLAY_NAME" \
             '.data[] | select(."display-name" == $n) | .id' \
         | head -1) || true
@@ -893,186 +978,111 @@ while [ -z "$POOL_ID" ]; do
 done
 log "Pool discovered: $POOL_ID"
 
-# Require N consecutive fully-idle readings (0 rooms + low CPU) before acting
-IDLE_STREAK=0
-REQUIRED_STREAK=3   # 3 × ~62s ≈ 3 minutes of sustained idle with no rooms
-
+# Poll every 30s: am I still a member of the pool?
+# When func.py detaches this instance (is_decrement_size=True), it disappears
+# from the pool member list — that is our drain signal.
 while true; do
-    # Only count RUNNING instances — excludes PROVISIONING, TERMINATING, etc.
-    POOL_JSON=$(oci_call oci compute-management instance-pool list-instances \
-        --instance-pool-id "$POOL_ID" \
+    IN_POOL=$(oci compute-management instance-pool list-instances \
         --compartment-id "$COMPARTMENT_ID" \
+        --instance-pool-id "$POOL_ID" \
         --auth instance_principal \
         --all \
-        --output json) || { log "list-instances failed. Retrying in 60s..."; sleep 60; continue; }
+        --output json 2>/dev/null \
+        | jq -r --arg id "$INSTANCE_OCID" \
+            '[.data[] | select(.id == $id)] | length' 2>/dev/null) || IN_POOL="1"
 
-    RUNNING_INSTANCES=$(echo "$POOL_JSON" | \
-        jq -c '[.data[] | select(.state == "RUNNING")]')
-    POOL_SIZE=$(echo "$RUNNING_INSTANCES" | jq 'length')
-
-    if [ "$POOL_SIZE" -le "$MIN_NODES" ]; then
-        [ "$IDLE_STREAK" -gt 0 ] && log "Pool at minimum ($POOL_SIZE). Resetting idle streak."
-        IDLE_STREAK=0
-        sleep 60
-        continue
+    if [ "$IN_POOL" = "0" ]; then
+        log "Instance no longer in pool — calling graceful shutdown."
+        exec /usr/local/bin/graceful_shutdown.sh
     fi
 
-    # PRIMARY GUARD: check for active rooms on this node via LiveKit API.
-    # A node with ANY active room must NEVER be considered for scale-in.
-    ACTIVE_ROOMS=$(get_active_rooms)
-    if [ "$ACTIVE_ROOMS" = "-1" ]; then
-        log "Failed to query active rooms (API error). Skipping cycle."
-        IDLE_STREAK=0
-        sleep 60
-        continue
-    fi
-
-    if [ "$ACTIVE_ROOMS" -gt 0 ]; then
-        [ "$IDLE_STREAK" -gt 0 ] && log "Node has $ACTIVE_ROOMS active room(s). Resetting idle streak."
-        IDLE_STREAK=0
-        sleep 60
-        continue
-    fi
-
-    # SECONDARY SIGNAL: CPU usage (confirms the node is genuinely idle)
-    LOCAL_CPU=$(get_cpu_usage)
-    log "Pool: $POOL_SIZE running, local CPU: $${LOCAL_CPU}%, active rooms: $ACTIVE_ROOMS"
-
-    if [ "$LOCAL_CPU" -ge "$SCALE_IN_CPU_THRESHOLD" ]; then
-        [ "$IDLE_STREAK" -gt 0 ] && log "CPU above threshold. Resetting idle streak."
-        IDLE_STREAK=0
-        sleep 60
-        continue
-    fi
-
-    IDLE_STREAK=$(( IDLE_STREAK + 1 ))
-    log "Idle streak: $IDLE_STREAK/$REQUIRED_STREAK (cpu=$${LOCAL_CPU}% < $${SCALE_IN_CPU_THRESHOLD}%, rooms=0)"
-
-    if [ "$IDLE_STREAK" -lt "$REQUIRED_STREAK" ]; then
-        sleep 60
-        continue
-    fi
-
-    # Select oldest RUNNING instance as sole scale-in candidate
-    OLDEST_ID=$(echo "$RUNNING_INSTANCES" | \
-        jq -r 'sort_by(.["time-created"]) | .[0].id')
-
-    if [ "$OLDEST_ID" != "$INSTANCE_OCID" ]; then
-        log "Oldest instance is $OLDEST_ID (not us). Standing down."
-        IDLE_STREAK=0
-        sleep 60
-        continue
-    fi
-
-    # Random jitter 0-30s: staggers decisions from nodes that simultaneously passed the check
-    JITTER=$(( RANDOM % 30 ))
-    log "We are the oldest idle node with 0 rooms. Waiting $${JITTER}s jitter before committing..."
-    sleep "$JITTER"
-
-    # Re-verify ALL conditions after jitter — another node may have detached, or a room
-    # may have been created in the jitter window.
-    POOL_JSON_RV=$(oci_call oci compute-management instance-pool list-instances \
-        --instance-pool-id "$POOL_ID" \
-        --compartment-id "$COMPARTMENT_ID" \
-        --auth instance_principal \
-        --all \
-        --output json) || { log "list-instances (re-verify) failed. Retrying in 60s..."; sleep 60; continue; }
-
-    RUNNING_RV=$(echo "$POOL_JSON_RV" | jq -c '[.data[] | select(.state == "RUNNING")]')
-    POOL_SIZE_RV=$(echo "$RUNNING_RV" | jq 'length')
-    OLDEST_RV=$(echo "$RUNNING_RV" | jq -r 'sort_by(.["time-created"]) | .[0].id')
-    CPU_RV=$(get_cpu_usage)
-
-    # Re-check active rooms — CRITICAL guard against race condition
-    ROOMS_RV=$(get_active_rooms)
-
-    if [ "$POOL_SIZE_RV" -le "$MIN_NODES" ] || \
-       [ "$CPU_RV" -ge "$SCALE_IN_CPU_THRESHOLD" ] || \
-       [ "$OLDEST_RV" != "$INSTANCE_OCID" ] || \
-       [ "$ROOMS_RV" != "0" ]; then
-        log "Conditions changed after jitter (pool=$POOL_SIZE_RV, cpu=$${CPU_RV}%, oldest=$OLDEST_RV, rooms=$ROOMS_RV). Aborting."
-        IDLE_STREAK=0
-        sleep 60
-        continue
-    fi
-
-    log "Committed to scale-in. Pool: $POOL_SIZE_RV, CPU: $${CPU_RV}%, Rooms: 0"
-    touch "$DRAIN_LOCK"
-
-    # Step 1: SIGQUIT BEFORE detach — stops OpenVidu accepting new sessions while still
-    # registered, so the master node doesn't route new rooms here during the detach window
-    if command -v docker &>/dev/null; then
-        log "Sending SIGQUIT to OpenVidu containers (stop accepting new sessions)..."
-        docker container kill --signal=SIGQUIT openvidu 2>/dev/null || true
-        docker container kill --signal=SIGQUIT ingress 2>/dev/null || true
-        docker container kill --signal=SIGQUIT egress 2>/dev/null || true
-        for agent in $(docker ps --filter "label=openvidu-agent=true" --format '{{.Names}}' 2>/dev/null); do
-            docker container kill --signal=SIGQUIT "$agent" 2>/dev/null || true
-        done
-    fi
-
-    # Step 2: Detach from pool — reduces pool target by 1 with no replacement spawned.
-    # Instance is now completely independent; OCI will never send ACPI or force-terminate it.
-    log "Detaching from pool..."
-    oci_call oci compute-management instance-pool detach-instance \
-        --instance-pool-id "$POOL_ID" \
-        --instance-id "$INSTANCE_OCID" \
-        --is-decrement-size true \
-        --is-auto-terminate false \
-        --auth instance_principal \
-        --force \
-        && log "Detached from pool." \
-        || log "Warning: detach failed — drain continues independently."
-
-    # Step 3: Wait for any sessions that may have started in the tiny window between
-    # the last room check and SIGQUIT. Instance is outside the pool — no OCI timeout applies.
-    if command -v docker &>/dev/null; then
-        log "Waiting for all sessions to end (no time limit)..."
-        while [ "$(docker ps --filter 'label=openvidu-agent=true' -q 2>/dev/null | wc -l)" -gt 0 ] || \
-              [ "$(docker inspect -f '{{.State.Running}}' openvidu 2>/dev/null)" = "true" ] || \
-              [ "$(docker inspect -f '{{.State.Running}}' ingress 2>/dev/null)" = "true" ] || \
-              [ "$(docker inspect -f '{{.State.Running}}' egress 2>/dev/null)" = "true" ]; do
-            log "Sessions still active. Waiting 30s..."
-            sleep 30
-        done
-        log "All sessions ended."
-    fi
-
-    # Step 4: Self-terminate via OCI API (boot volume not preserved)
-    log "Self-terminating..."
-    oci_call oci compute instance terminate \
-        --instance-id "$INSTANCE_OCID" \
-        --auth instance_principal \
-        --preserve-boot-volume false \
-        --force \
-        && exit 0 || true
-
-    log "OCI terminate API failed. Falling back to OS shutdown."
-    shutdown -h now
-    exit 0
+    sleep 30
 done
 EOF
 
-  # Fallback graceful shutdown — runs only if an ACPI shutdown arrives outside the daemon's
-  # control (e.g., manual termination via console). The OCI native autoscaler scale-in rule
-  # uses an impossible threshold (CPU < 0%) so it will never trigger.
-  # Checks the drain lock to avoid sending SIGQUIT twice if the daemon already acted.
+  # invoke_terminate.py — Python script that calls the scale-in function
+  # with a terminate_instance_id payload using the OCI SDK directly.
+  #
+  # Why a Python script instead of `oci fn function invoke --body ...`:
+  # OCI CLI 3.83 does NOT reliably ship the --body content to the function
+  # — empirically (verified in scale-in fn logs) the function receives an
+  # empty/unparseable body and falls into the scale-in branch instead of
+  # the terminate branch. The Python SDK lets us pass the body as raw bytes
+  # so there is no shell quoting / CLI parsing layer in between.
+  #
+  # Runs under the pipx-installed OCI CLI venv's Python, which has the oci
+  # SDK available without any extra install.
+  invoke_terminate_script = <<-PYEOF
+#!/root/.local/share/pipx/venvs/oci-cli/bin/python
+"""Invoke the scale-in function with a {"terminate_instance_id": "<ocid>"}
+body. Uses Instance Principal auth (works on any compartment member node)."""
+import json
+import sys
+
+import oci
+
+FN_ID = "${oci_functions_function.scale_in_fn.id}"
+
+
+def main() -> int:
+    if len(sys.argv) != 2:
+        print("Usage: invoke_terminate.py <instance_ocid>", file=sys.stderr)
+        return 2
+    instance_ocid = sys.argv[1]
+
+    signer = oci.auth.signers.InstancePrincipalsSecurityTokenSigner()
+    mgmt = oci.functions.FunctionsManagementClient(config={}, signer=signer)
+    fn = mgmt.get_function(function_id=FN_ID).data
+    invoke = oci.functions.FunctionsInvokeClient(
+        config={}, signer=signer, service_endpoint=fn.invoke_endpoint
+    )
+
+    body = json.dumps({"terminate_instance_id": instance_ocid}).encode()
+    print(f"[invoke_terminate] body={body!r}", file=sys.stderr)
+
+    result = invoke.invoke_function(function_id=FN_ID, invoke_function_body=body)
+
+    # result.data is a urllib3 response stream
+    try:
+        text = result.data.text
+    except AttributeError:
+        try:
+            text = result.data.content.decode("utf-8", errors="replace")
+        except AttributeError:
+            text = str(result.data)
+    print(f"[invoke_terminate] response={text}", file=sys.stderr)
+    print(text)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+PYEOF
+
+  # graceful_shutdown.sh — single drain+terminate script called from two paths:
+  #   1. openvidu-pre-drain.service: pool detach detected → exec graceful_shutdown.sh
+  #   2. graceful_shutdown.service: ACPI shutdown (e.g. manual terminate from console)
+  # A lock file prevents double execution when both paths fire simultaneously.
   graceful_shutdown_script = <<-EOF
 #!/bin/bash
-# Fallback graceful shutdown for OpenVidu Media Node (OCI)
-# Primary drain is handled by the pre-drain daemon; this is only a safety net.
+# Graceful shutdown for OpenVidu Media Node (OCI)
+# Called by the pre-drain daemon (detected pool detach) and by the systemd
+# fallback service (ACPI shutdown). In both cases: drain + self-terminate.
+
+export HOME="/root"
+export PATH="$PATH:/root/.local/bin"
 
 DRAIN_LOCK="/var/run/openvidu-drain.lock"
 
 if [ -f "$DRAIN_LOCK" ]; then
-    echo "[graceful-shutdown] Pre-drain daemon already handled drain. Proceeding with shutdown."
+    echo "[graceful-shutdown] Drain already in progress. Exiting."
     exit 0
 fi
+touch "$DRAIN_LOCK"
 
-echo "[graceful-shutdown] Starting fallback graceful shutdown..."
+echo "[graceful-shutdown] Starting graceful shutdown..."
 
-# Note: no 'set -e' — we must not abort if any individual command fails,
-# as that would let the OS power off before containers have stopped.
+# Step 1: SIGQUIT — stop accepting new sessions
 if command -v docker &>/dev/null; then
     docker container kill --signal=SIGQUIT openvidu 2>/dev/null || true
     docker container kill --signal=SIGQUIT ingress 2>/dev/null || true
@@ -1081,6 +1091,7 @@ if command -v docker &>/dev/null; then
         docker container kill --signal=SIGQUIT "$agent" 2>/dev/null || true
     done
 
+    # Step 2: Wait for all containers to finish (no time limit)
     while [ "$(docker ps --filter 'label=openvidu-agent=true' -q 2>/dev/null | wc -l)" -gt 0 ] || \
           [ "$(docker inspect -f '{{.State.Running}}' openvidu 2>/dev/null)" = "true" ] || \
           [ "$(docker inspect -f '{{.State.Running}}' ingress 2>/dev/null)" = "true" ] || \
@@ -1090,7 +1101,31 @@ if command -v docker &>/dev/null; then
     done
 fi
 
-echo "[graceful-shutdown] Completed."
+echo "[graceful-shutdown] All containers stopped. Self-terminating..."
+
+# Step 3: Request termination via OCI Function (Resource Principal).
+# Direct instance_principal terminate is blocked by a tenancy-level deny policy;
+# the scale-in function uses Resource Principal auth which is not subject to the
+# same restriction and can call TerminateInstance on our behalf.
+INSTANCE_OCID=$(curl -sf -H "Authorization: Bearer Oracle" \
+    "http://169.254.169.254/opc/v2/instance/" | jq -r '.id')
+echo "[graceful-shutdown] Instance OCID: $INSTANCE_OCID"
+
+attempt=0
+while true; do
+    attempt=$((attempt + 1))
+    echo "[graceful-shutdown] Terminate via function, attempt $attempt..."
+    # Calls the scale-in function via OCI Python SDK (see invoke_terminate.py
+    # docstring): bypasses `oci fn function invoke --body ...` which does NOT
+    # reliably deliver the JSON body in CLI 3.83.
+    if /usr/local/bin/invoke_terminate.py "$INSTANCE_OCID"; then
+        echo "[graceful-shutdown] Terminate request accepted on attempt $attempt. Waiting for OCI to terminate."
+        while true; do sleep 60; done
+    else
+        echo "[graceful-shutdown] Attempt $attempt failed. Retrying in 15s..."
+        sleep 15
+    fi
+done
 EOF
 
   config_s3_script = <<-EOF
@@ -1184,6 +1219,10 @@ export PATH="$PATH:$HOME/.local/bin"
 # Create counter file for tracking script executions
 echo 1 > /usr/local/bin/openvidu_install_counter.txt
 
+# Mark secrets as not ready before generating them, so media nodes
+# from a previous deployment don't read stale values.
+/usr/local/bin/store_secret.sh save ALL_SECRETS_GENERATED "false"
+
 # Configure domain using OCI IMDS v2
 get_meta() { curl -sf -H "Authorization: Bearer Oracle" "http://169.254.169.254/opc/v2/instance/$1"; }
 # Resolve the public IP with explicit fallbacks. The jq pipe always exits 0
@@ -1262,10 +1301,15 @@ COMMON_ARGS=(
   "--grafana-admin-user=$GRAFANA_ADMIN_USERNAME"
   "--grafana-admin-password=$GRAFANA_ADMIN_PASSWORD"
   "--meet-initial-admin-password=$MEET_INITIAL_ADMIN_PASSWORD"
-  "--meet-initial-api-key=$MEET_INITIAL_API_KEY"
   "--livekit-api-key=$LIVEKIT_API_KEY"
   "--livekit-api-secret=$LIVEKIT_API_SECRET"
 )
+
+# Only pass --meet-initial-api-key when the user provided one. Passing an empty
+# value would explicitly null out the installer default.
+if [[ "${var.initialMeetApiKey}" != '' ]]; then
+  COMMON_ARGS+=("--meet-initial-api-key=$MEET_INITIAL_API_KEY")
+fi
 
 # Include additional installer flags provided by the user
 if [[ "${var.additionalInstallFlags}" != "" ]]; then
@@ -1325,73 +1369,43 @@ set -e
 
 export HOME="/root"
 export PATH="$PATH:$HOME/.local/bin"
+export OCI_CLI_DISABLE_DEFAULT_RETRY=True
+
+VAULT_ID="${var.vault_ocid != "" ? var.vault_ocid : oci_kms_vault.openvidu_vault[0].id}"
+KEY_ID="${var.key_ocid != "" ? var.key_ocid : oci_kms_key.openvidu_key[0].id}"
+COMPARTMENT_ID="${var.compartment_ocid}"
+
+# shellcheck source=/dev/null
+. /usr/local/bin/oci_helpers.sh
 
 INSTALL_DIR="/opt/openvidu"
 CLUSTER_CONFIG_DIR="$${INSTALL_DIR}/config/cluster"
 MASTER_NODE_CONFIG_DIR="$${INSTALL_DIR}/config/node"
 
-# Helper: get secret value from OCI Vault via Instance Principal
-get_secret() {
-  local secret_name="$1"
-  local secret_id
-  secret_id=$(oci vault secret list \
-    --compartment-id ${var.compartment_ocid} \
-    --all \
-    --query "data[?\"secret-name\"=='$secret_name' && \"lifecycle-state\"=='ACTIVE'].id | [0]" \
-    --raw-output \
-    --auth instance_principal)
-  oci secrets secret-bundle get \
-    --secret-id "$secret_id" \
-    --query 'data."secret-bundle-content".content' \
-    --raw-output \
-    --auth instance_principal | base64 -d
-}
-
-# Helper: update secret value in OCI Vault
-update_secret() {
-  local secret_name="$1"
-  local secret_value="$2"
-  local secret_id
-  secret_id=$(oci vault secret list \
-    --compartment-id ${var.compartment_ocid} \
-    --all \
-    --query "data[?\"secret-name\"=='$secret_name' && \"lifecycle-state\"=='ACTIVE'].id | [0]" \
-    --raw-output \
-    --auth instance_principal)
-  if [[ -z "$secret_id" || "$secret_id" == "null" ]]; then
-    echo "Secret $secret_name not found in vault" >&2; return 1
-  fi
-  oci vault secret update-base64 \
-    --secret-id "$secret_id" \
-    --secret-content-content "$(echo -n "$secret_value" | base64)" \
-    --enable-auto-generation false \
-    --auth instance_principal
-}
-
-export DOMAIN=$(get_secret DOMAIN_NAME)
+export DOMAIN=$(get_from_vault DOMAIN_NAME)
 [[ -n "$DOMAIN" ]] || exit 1
 sed -i "s/DOMAIN_NAME=.*/DOMAIN_NAME=$DOMAIN/" "$${CLUSTER_CONFIG_DIR}/openvidu.env"
 
-export REDIS_PASSWORD=$(get_secret REDIS_PASSWORD)
-export OPENVIDU_RTC_ENGINE=$(get_secret OPENVIDU_RTC_ENGINE)
-export OPENVIDU_PRO_LICENSE=$(get_secret OPENVIDU_PRO_LICENSE)
-export MONGO_ADMIN_USERNAME=$(get_secret MONGO_ADMIN_USERNAME)
-export MONGO_ADMIN_PASSWORD=$(get_secret MONGO_ADMIN_PASSWORD)
-export MONGO_REPLICA_SET_KEY=$(get_secret MONGO_REPLICA_SET_KEY)
-export DASHBOARD_ADMIN_USERNAME=$(get_secret DASHBOARD_ADMIN_USERNAME)
-export DASHBOARD_ADMIN_PASSWORD=$(get_secret DASHBOARD_ADMIN_PASSWORD)
-export MINIO_ACCESS_KEY=$(get_secret MINIO_ACCESS_KEY)
-export MINIO_SECRET_KEY=$(get_secret MINIO_SECRET_KEY)
-export GRAFANA_ADMIN_USERNAME=$(get_secret GRAFANA_ADMIN_USERNAME)
-export GRAFANA_ADMIN_PASSWORD=$(get_secret GRAFANA_ADMIN_PASSWORD)
-export LIVEKIT_API_KEY=$(get_secret LIVEKIT_API_KEY)
-export LIVEKIT_API_SECRET=$(get_secret LIVEKIT_API_SECRET)
-export MEET_INITIAL_ADMIN_USER=$(get_secret MEET_INITIAL_ADMIN_USER)
-export MEET_INITIAL_ADMIN_PASSWORD=$(get_secret MEET_INITIAL_ADMIN_PASSWORD)
+export REDIS_PASSWORD=$(get_from_vault REDIS_PASSWORD)
+export OPENVIDU_RTC_ENGINE=$(get_from_vault OPENVIDU_RTC_ENGINE)
+export OPENVIDU_PRO_LICENSE=$(get_from_vault OPENVIDU_PRO_LICENSE)
+export MONGO_ADMIN_USERNAME=$(get_from_vault MONGO_ADMIN_USERNAME)
+export MONGO_ADMIN_PASSWORD=$(get_from_vault MONGO_ADMIN_PASSWORD)
+export MONGO_REPLICA_SET_KEY=$(get_from_vault MONGO_REPLICA_SET_KEY)
+export DASHBOARD_ADMIN_USERNAME=$(get_from_vault DASHBOARD_ADMIN_USERNAME)
+export DASHBOARD_ADMIN_PASSWORD=$(get_from_vault DASHBOARD_ADMIN_PASSWORD)
+export MINIO_ACCESS_KEY=$(get_from_vault MINIO_ACCESS_KEY)
+export MINIO_SECRET_KEY=$(get_from_vault MINIO_SECRET_KEY)
+export GRAFANA_ADMIN_USERNAME=$(get_from_vault GRAFANA_ADMIN_USERNAME)
+export GRAFANA_ADMIN_PASSWORD=$(get_from_vault GRAFANA_ADMIN_PASSWORD)
+export LIVEKIT_API_KEY=$(get_from_vault LIVEKIT_API_KEY)
+export LIVEKIT_API_SECRET=$(get_from_vault LIVEKIT_API_SECRET)
+export MEET_INITIAL_ADMIN_USER=$(get_from_vault MEET_INITIAL_ADMIN_USER)
+export MEET_INITIAL_ADMIN_PASSWORD=$(get_from_vault MEET_INITIAL_ADMIN_PASSWORD)
 if [[ "${var.initialMeetApiKey}" != '' ]]; then
-  export MEET_INITIAL_API_KEY=$(get_secret MEET_INITIAL_API_KEY)
+  export MEET_INITIAL_API_KEY=$(get_from_vault MEET_INITIAL_API_KEY)
 fi
-export ENABLED_MODULES=$(get_secret ENABLED_MODULES)
+export ENABLED_MODULES=$(get_from_vault ENABLED_MODULES)
 
 sed -i "s/REDIS_PASSWORD=.*/REDIS_PASSWORD=$REDIS_PASSWORD/" "$${MASTER_NODE_CONFIG_DIR}/master_node.env"
 sed -i "s/OPENVIDU_RTC_ENGINE=.*/OPENVIDU_RTC_ENGINE=$OPENVIDU_RTC_ENGINE/" "$${CLUSTER_CONFIG_DIR}/openvidu.env"
@@ -1420,43 +1434,44 @@ LIVEKIT_URL="wss://$${DOMAIN}/"
 DASHBOARD_URL="https://$${DOMAIN}/dashboard/"
 GRAFANA_URL="https://$${DOMAIN}/grafana/"
 MINIO_URL="https://$${DOMAIN}/minio-console/"
-update_secret DOMAIN_NAME "$DOMAIN"
-update_secret OPENVIDU_URL "$OPENVIDU_URL"
-update_secret LIVEKIT_URL "$LIVEKIT_URL"
-update_secret DASHBOARD_URL "$DASHBOARD_URL"
-update_secret GRAFANA_URL "$GRAFANA_URL"
-update_secret MINIO_URL "$MINIO_URL"
+store_in_vault DOMAIN_NAME "$DOMAIN"
+store_in_vault OPENVIDU_URL "$OPENVIDU_URL"
+store_in_vault LIVEKIT_URL "$LIVEKIT_URL"
+store_in_vault DASHBOARD_URL "$DASHBOARD_URL"
+store_in_vault GRAFANA_URL "$GRAFANA_URL"
+store_in_vault MINIO_URL "$MINIO_URL"
 EOF
 
   update_secret_from_config_script = <<-EOF
-#!/bin/bash
+#!/bin/bash -x
 set -e
 
 export HOME="/root"
 export PATH="$PATH:$HOME/.local/bin"
+export OCI_CLI_DISABLE_DEFAULT_RETRY=True
+
+VAULT_ID="${var.vault_ocid != "" ? var.vault_ocid : oci_kms_vault.openvidu_vault[0].id}"
+KEY_ID="${var.key_ocid != "" ? var.key_ocid : oci_kms_key.openvidu_key[0].id}"
+COMPARTMENT_ID="${var.compartment_ocid}"
+
+# shellcheck source=/dev/null
+. /usr/local/bin/oci_helpers.sh
 
 INSTALL_DIR="/opt/openvidu"
 CLUSTER_CONFIG_DIR="$${INSTALL_DIR}/config/cluster"
 MASTER_NODE_CONFIG_DIR="$${INSTALL_DIR}/config/node"
 
-update_secret() {
-  local secret_name="$1"
-  local secret_value="$2"
-  local secret_id
-  secret_id=$(oci vault secret list \
-    --compartment-id ${var.compartment_ocid} \
-    --all \
-    --query "data[?\"secret-name\"=='$secret_name' && \"lifecycle-state\"=='ACTIVE'].id | [0]" \
-    --raw-output \
-    --auth instance_principal)
-  if [[ -z "$secret_id" || "$secret_id" == "null" ]]; then
-    echo "Secret $secret_name not found in vault" >&2; return 1
+# Skip writes when the config didn't yield a real value. Without this, an
+# unset / commented-out config key gets persisted to vault as the literal
+# string we'd otherwise have written ("" or "none"), corrupting the secret.
+maybe_save() {
+  local key="$1"
+  local value="$2"
+  if [[ -z "$value" || "$value" == "none" ]]; then
+    echo "[update_secret_from_config] Skipping '$key': empty value in config" >&2
+    return 0
   fi
-  oci vault secret update-base64 \
-    --secret-id "$secret_id" \
-    --secret-content-content "$(echo -n "$secret_value" | base64)" \
-    --enable-auto-generation false \
-    --auth instance_principal
+  store_in_vault "$key" "$value"
 }
 
 REDIS_PASSWORD="$(/usr/local/bin/get_value_from_config.sh REDIS_PASSWORD "$${MASTER_NODE_CONFIG_DIR}/master_node.env")"
@@ -1481,31 +1496,31 @@ if [[ "${var.initialMeetApiKey}" != '' ]]; then
 fi
 ENABLED_MODULES="$(/usr/local/bin/get_value_from_config.sh ENABLED_MODULES "$${CLUSTER_CONFIG_DIR}/openvidu.env")"
 
-update_secret REDIS_PASSWORD "$REDIS_PASSWORD"
-update_secret DOMAIN_NAME "$DOMAIN_NAME"
-update_secret OPENVIDU_RTC_ENGINE "$OPENVIDU_RTC_ENGINE"
-update_secret OPENVIDU_PRO_LICENSE "$OPENVIDU_PRO_LICENSE"
-update_secret MONGO_ADMIN_USERNAME "$MONGO_ADMIN_USERNAME"
-update_secret MONGO_ADMIN_PASSWORD "$MONGO_ADMIN_PASSWORD"
-update_secret MONGO_REPLICA_SET_KEY "$MONGO_REPLICA_SET_KEY"
-update_secret MINIO_ACCESS_KEY "$MINIO_ACCESS_KEY"
-update_secret MINIO_SECRET_KEY "$MINIO_SECRET_KEY"
-update_secret DASHBOARD_ADMIN_USERNAME "$DASHBOARD_ADMIN_USERNAME"
-update_secret DASHBOARD_ADMIN_PASSWORD "$DASHBOARD_ADMIN_PASSWORD"
-update_secret GRAFANA_ADMIN_USERNAME "$GRAFANA_ADMIN_USERNAME"
-update_secret GRAFANA_ADMIN_PASSWORD "$GRAFANA_ADMIN_PASSWORD"
-update_secret LIVEKIT_API_KEY "$LIVEKIT_API_KEY"
-update_secret LIVEKIT_API_SECRET "$LIVEKIT_API_SECRET"
-update_secret MEET_INITIAL_ADMIN_USER "$MEET_INITIAL_ADMIN_USER"
-update_secret MEET_INITIAL_ADMIN_PASSWORD "$MEET_INITIAL_ADMIN_PASSWORD"
+maybe_save REDIS_PASSWORD "$REDIS_PASSWORD"
+maybe_save DOMAIN_NAME "$DOMAIN_NAME"
+maybe_save OPENVIDU_RTC_ENGINE "$OPENVIDU_RTC_ENGINE"
+maybe_save OPENVIDU_PRO_LICENSE "$OPENVIDU_PRO_LICENSE"
+maybe_save MONGO_ADMIN_USERNAME "$MONGO_ADMIN_USERNAME"
+maybe_save MONGO_ADMIN_PASSWORD "$MONGO_ADMIN_PASSWORD"
+maybe_save MONGO_REPLICA_SET_KEY "$MONGO_REPLICA_SET_KEY"
+maybe_save MINIO_ACCESS_KEY "$MINIO_ACCESS_KEY"
+maybe_save MINIO_SECRET_KEY "$MINIO_SECRET_KEY"
+maybe_save DASHBOARD_ADMIN_USERNAME "$DASHBOARD_ADMIN_USERNAME"
+maybe_save DASHBOARD_ADMIN_PASSWORD "$DASHBOARD_ADMIN_PASSWORD"
+maybe_save GRAFANA_ADMIN_USERNAME "$GRAFANA_ADMIN_USERNAME"
+maybe_save GRAFANA_ADMIN_PASSWORD "$GRAFANA_ADMIN_PASSWORD"
+maybe_save LIVEKIT_API_KEY "$LIVEKIT_API_KEY"
+maybe_save LIVEKIT_API_SECRET "$LIVEKIT_API_SECRET"
+maybe_save MEET_INITIAL_ADMIN_USER "$MEET_INITIAL_ADMIN_USER"
+maybe_save MEET_INITIAL_ADMIN_PASSWORD "$MEET_INITIAL_ADMIN_PASSWORD"
 if [[ "${var.initialMeetApiKey}" != '' ]]; then
-  update_secret MEET_INITIAL_API_KEY "$MEET_INITIAL_API_KEY"
+  maybe_save MEET_INITIAL_API_KEY "$MEET_INITIAL_API_KEY"
 fi
-update_secret ENABLED_MODULES "$ENABLED_MODULES"
+maybe_save ENABLED_MODULES "$ENABLED_MODULES"
 EOF
 
   get_value_from_config_script = <<-EOF
-#!/bin/bash -x
+#!/bin/bash
 set -e
 
 get_value() {
@@ -1528,78 +1543,14 @@ set -e
 
 export HOME="/root"
 export PATH="$PATH:$HOME/.local/bin"
+export OCI_CLI_DISABLE_DEFAULT_RETRY=True
 
 VAULT_ID="${var.vault_ocid != "" ? var.vault_ocid : oci_kms_vault.openvidu_vault[0].id}"
 KEY_ID="${var.key_ocid != "" ? var.key_ocid : oci_kms_key.openvidu_key[0].id}"
 COMPARTMENT_ID="${var.compartment_ocid}"
 
-# Helper: store or update a secret in OCI Vault via Instance Principal
-store_in_vault() {
-  local secret_name="$1"
-  local secret_value="$2"
-  local encoded_value
-  encoded_value=$(echo -n "$secret_value" | base64)
-
-  local secret_id
-  secret_id=$(oci vault secret list \
-    --compartment-id "$COMPARTMENT_ID" \
-    --all \
-    --query "data[?\"secret-name\"=='$secret_name' && \"lifecycle-state\"=='ACTIVE'].id | [0]" \
-    --raw-output \
-    --auth instance_principal)
-
-  if [[ -z "$secret_id" || "$secret_id" == "null" ]]; then
-    # Check for pending-deletion state and restore if found
-    local pending_id
-    pending_id=$(oci vault secret list \
-      --compartment-id "$COMPARTMENT_ID" \
-      --all \
-      --query "data[?\"secret-name\"=='$secret_name' && (\"lifecycle-state\"=='PENDING_DELETION' || \"lifecycle-state\"=='SCHEDULED_FOR_DELETION')].id | [0]" \
-      --raw-output \
-      --auth instance_principal)
-
-    if [[ -n "$pending_id" && "$pending_id" != "null" ]]; then
-      oci vault secret cancel-secret-deletion --secret-id "$pending_id" --auth instance_principal > /dev/null
-      oci vault secret update-base64 \
-        --secret-id "$pending_id" \
-        --secret-content-content "$encoded_value" \
-        --enable-auto-generation false \
-        --auth instance_principal > /dev/null
-    else
-      oci vault secret create-base64 \
-        --compartment-id "$COMPARTMENT_ID" \
-        --secret-name "$secret_name" \
-        --vault-id "$VAULT_ID" \
-        --key-id "$KEY_ID" \
-        --secret-content-content "$encoded_value" \
-        --secret-content-name "$secret_name" \
-        --auth instance_principal > /dev/null
-    fi
-  else
-    oci vault secret update-base64 \
-      --secret-id "$secret_id" \
-      --secret-content-content "$encoded_value" \
-      --enable-auto-generation false \
-      --auth instance_principal > /dev/null
-  fi
-}
-
-# Helper: read a secret value from OCI Vault
-get_from_vault() {
-  local secret_name="$1"
-  local secret_id
-  secret_id=$(oci vault secret list \
-    --compartment-id "$COMPARTMENT_ID" \
-    --all \
-    --query "data[?\"secret-name\"=='$secret_name' && \"lifecycle-state\"=='ACTIVE'].id | [0]" \
-    --raw-output \
-    --auth instance_principal)
-  oci secrets secret-bundle get \
-    --secret-id "$secret_id" \
-    --query 'data."secret-bundle-content".content' \
-    --raw-output \
-    --auth instance_principal | base64 -d
-}
+# shellcheck source=/dev/null
+. /usr/local/bin/oci_helpers.sh
 
 MODE="$1"
 if [[ "$MODE" == "generate" ]]; then
@@ -1619,16 +1570,24 @@ elif [[ "$MODE" == "get" ]]; then
   SECRET_KEY_NAME="$2"
   get_from_vault "$SECRET_KEY_NAME"
 else
+  echo "Usage: $0 {generate|save|get} SECRET_NAME [VALUE|PREFIX] [LENGTH]" >&2
   exit 1
 fi
 EOF
 
   check_app_ready_script = <<-EOF
 #!/bin/bash
+FAIL_COUNT=0
 while true; do
-  HTTP_STATUS=$(curl -Ik http://localhost:7880/health/caddy | head -n1 | awk '{print $2}')
+  HTTP_STATUS=$(curl -Ik http://localhost:7880/health/caddy 2>/dev/null | head -n1 | awk '{print $2}')
   if [ "$HTTP_STATUS" == "200" ]; then
     break
+  fi
+  FAIL_COUNT=$((FAIL_COUNT + 1))
+  if [ $FAIL_COUNT -ge 10 ]; then
+    echo "[check_app_ready] $FAIL_COUNT consecutive failures, restarting openvidu..."
+    systemctl restart openvidu
+    FAIL_COUNT=0
   fi
   sleep 5
 done
@@ -1676,6 +1635,12 @@ INSTALL_EOF
 ${local.after_install_script}
 AFTER_INSTALL_EOF
   chmod +x /usr/local/bin/after_install.sh
+
+  # oci_helpers.sh — must come BEFORE the scripts that source it
+  cat > /usr/local/bin/oci_helpers.sh << 'OCI_HELPERS_EOF'
+${local.oci_helpers_script}
+OCI_HELPERS_EOF
+  chmod +x /usr/local/bin/oci_helpers.sh
 
   # update_config_from_secret.sh
   cat > /usr/local/bin/update_config_from_secret.sh << 'UPDATE_CONFIG_EOF'
@@ -1726,7 +1691,7 @@ CONFIG_S3_EOF
 
   # Install OCI CLI via pipx (correct method for modern Ubuntu)
   export HOME="/root"
-  OCI_CLI_VERSION="3.52.0"
+  OCI_CLI_VERSION="3.83.0"
   pipx install oci-cli==$${OCI_CLI_VERSION}
   export PATH="$PATH:$HOME/.local/bin"
 
@@ -1742,8 +1707,60 @@ CONFIG_S3_EOF
   # Update shared secrets
   /usr/local/bin/after_install.sh || { echo "[OpenVidu] error updating shared secrets"; exit 1; }
 
-  # Schedule restart on reboot via crontab
-  echo "@reboot /usr/local/bin/restart.sh >> /var/log/openvidu-restart.log 2>&1" | crontab
+  # Create scale-in function invoker script
+  cat > /usr/local/bin/invoke_scalein.sh << 'INVOKE_EOF'
+#!/bin/bash
+export HOME="/root"
+export PATH="$PATH:/root/.local/bin"
+oci fn function invoke \
+  --function-id ${oci_functions_function.scale_in_fn.id} \
+  --fn-invoke-type sync \
+  --file /dev/stdout \
+  --body '' \
+  --auth instance_principal
+INVOKE_EOF
+  chmod +x /usr/local/bin/invoke_scalein.sh
+
+  # Create boot volume cleanup script
+  cat > /usr/local/bin/cleanup_boot_volumes.sh << 'CLEANUP_EOF'
+#!/bin/bash
+export HOME="/root"
+export PATH="$PATH:/root/.local/bin"
+COMPARTMENT_ID="${var.compartment_ocid}"
+POOL_PREFIX="${var.stackName}-media-pool"
+oci bv boot-volume list \
+  --compartment-id "$COMPARTMENT_ID" \
+  --all --output json \
+  --auth instance_principal \
+  2>/dev/null \
+| jq -r --arg p "$POOL_PREFIX" \
+    '.data[] | select(."lifecycle-state" == "AVAILABLE" and (."display-name" | contains($p))) | .id' \
+| while read -r BV_ID; do
+    ATTACHED=$(oci compute boot-volume-attachment list \
+      --compartment-id "$COMPARTMENT_ID" \
+      --boot-volume-id "$BV_ID" \
+      --output json \
+      --auth instance_principal \
+      2>/dev/null \
+      | jq '[.data[] | select(."lifecycle-state" != "DETACHED" and ."lifecycle-state" != "DETACHING")] | length')
+    if [ "$ATTACHED" = "0" ]; then
+      echo "[cleanup-bv] Deleting orphaned boot volume $BV_ID..."
+      oci bv boot-volume delete \
+        --boot-volume-id "$BV_ID" \
+        --force \
+        --auth instance_principal \
+        2>/dev/null || true
+    fi
+  done
+CLEANUP_EOF
+  chmod +x /usr/local/bin/cleanup_boot_volumes.sh
+
+  # Schedule restart on reboot, scale-in every 5 min, boot volume cleanup every 5 min
+  { \
+    echo "@reboot /usr/local/bin/restart.sh >> /var/log/openvidu-restart.log 2>&1"; \
+    echo "*/5 * * * * /usr/local/bin/invoke_scalein.sh >> /dev/null 2>&1"; \
+    echo "*/5 * * * * /usr/local/bin/cleanup_boot_volumes.sh >> /var/log/openvidu-cleanup-bv.log 2>&1"; \
+  } | crontab
 
   # Mark installation as complete
   echo "installation_complete" > /usr/local/bin/openvidu_install_counter.txt
@@ -1820,17 +1837,53 @@ get_meta() { curl -sf -H "Authorization: Bearer Oracle" "http://169.254.169.254/
 MASTER_NODE_PRIVATE_IP=$(get_meta "" | jq -r '.metadata.masterNodePrivateIP // empty')
 PRIVATE_IP=$(get_meta "vnics/" | jq -r '.[0].privateIp' 2>/dev/null || hostname -I | awk '{print $1}')
 
+# Helper: run an OCI CLI command with automatic retry on transient errors
+oci_with_retry() {
+  local max_attempts=5
+  local attempt=0
+  local delay=10
+  local stderr_file
+  stderr_file=$(mktemp)
+  while true; do
+    attempt=$((attempt + 1))
+    if output=$("$@" 2>"$stderr_file"); then
+      rm -f "$stderr_file"
+      echo "$output"
+      return 0
+    fi
+    if [[ $attempt -ge $max_attempts ]]; then
+      cat "$stderr_file" >&2
+      rm -f "$stderr_file"
+      return 1
+    fi
+    echo "[get_secret] OCI API call failed (attempt $attempt/$max_attempts), retrying in $${delay}s..." >&2
+    sleep "$delay"
+    delay=$((delay * 2))
+  done
+}
+
+ocid_from_query() {
+  local result
+  result=$("$@")
+  if [[ "$result" == *"Query returned empty result"* || "$result" == "null" ]]; then
+    echo ""
+  else
+    echo "$result"
+  fi
+}
+
 # Helper: read a secret from OCI Vault via Instance Principal
 get_secret() {
   local secret_name="$1"
   local secret_id
-  secret_id=$(oci vault secret list \
+  secret_id=$(ocid_from_query oci_with_retry oci vault secret list \
     --compartment-id "${var.compartment_ocid}" \
+    --vault-id "${var.vault_ocid != "" ? var.vault_ocid : oci_kms_vault.openvidu_vault[0].id}" \
     --all \
     --query "data[?\"secret-name\"=='$secret_name' && \"lifecycle-state\"=='ACTIVE'].id | [0]" \
     --raw-output \
     --auth instance_principal)
-  oci secrets secret-bundle get \
+  oci_with_retry oci secrets secret-bundle get \
     --secret-id "$secret_id" \
     --query 'data."secret-bundle-content".content' \
     --raw-output \
@@ -1888,7 +1941,7 @@ apt-get update && apt-get install -y \
 
 # Install OCI CLI via pipx — required by install script and pre-drain daemon
 export HOME="/root"
-OCI_CLI_VERSION="3.52.0"
+OCI_CLI_VERSION="3.83.0"
 pipx install oci-cli==$${OCI_CLI_VERSION}
 export PATH="$PATH:$HOME/.local/bin"
 
@@ -1897,8 +1950,6 @@ mkdir -p /etc/openvidu
 cat > /etc/openvidu/predrain.conf << 'CONF_EOF'
 COMPARTMENT_ID=${var.compartment_ocid}
 POOL_DISPLAY_NAME=${var.stackName}-media-pool
-MIN_NODES=${var.minNumberOfMediaNodes}
-SCALE_IN_CPU_THRESHOLD=${var.scaleTargetCPU}
 CONF_EOF
 
 # install.sh
@@ -1939,13 +1990,21 @@ StandardError=journal
 WantedBy=multi-user.target
 PREDRAIN_SVC_EOF
 
+# invoke_terminate.py — called by graceful_shutdown.sh to ask the scale-in
+# function to terminate this instance. Uses the OCI Python SDK directly to
+# avoid OCI CLI 3.83's broken --body handling for fn function invoke.
+cat > /usr/local/bin/invoke_terminate.py << 'INVOKE_TERMINATE_EOF'
+${local.invoke_terminate_script}
+INVOKE_TERMINATE_EOF
+chmod +x /usr/local/bin/invoke_terminate.py
+
 # Layer 2: fallback systemd shutdown service
-cat > /usr/local/bin/openvidu-graceful-shutdown.sh << 'SHUTDOWN_SCRIPT_EOF'
+cat > /usr/local/bin/graceful_shutdown.sh << 'SHUTDOWN_SCRIPT_EOF'
 ${local.graceful_shutdown_script}
 SHUTDOWN_SCRIPT_EOF
-chmod +x /usr/local/bin/openvidu-graceful-shutdown.sh
+chmod +x /usr/local/bin/graceful_shutdown.sh
 
-cat > /etc/systemd/system/openvidu-graceful-shutdown.service << 'SERVICE_EOF'
+cat > /etc/systemd/system/graceful_shutdown.service << 'SERVICE_EOF'
 [Unit]
 Description=OpenVidu Graceful Shutdown (fallback)
 DefaultDependencies=no
@@ -1954,11 +2013,11 @@ After=network.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/openvidu-graceful-shutdown.sh
+ExecStart=/usr/local/bin/graceful_shutdown.sh
 TimeoutStartSec=infinity
 TimeoutStopSec=infinity
 RemainAfterExit=yes
-KillMode=none
+KillMode=control-group
 
 [Install]
 WantedBy=halt.target reboot.target shutdown.target
@@ -1969,7 +2028,7 @@ sed -i 's/^#*DefaultTimeoutStopSec=.*/DefaultTimeoutStopSec=infinity/' /etc/syst
 
 systemctl daemon-reload
 systemctl enable openvidu-pre-drain.service
-systemctl enable openvidu-graceful-shutdown.service
+systemctl enable graceful_shutdown.service
 
 # Install OpenVidu media node
 /usr/local/bin/install.sh || { echo "[OpenVidu] error installing media node"; exit 1; }

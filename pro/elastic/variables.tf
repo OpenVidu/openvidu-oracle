@@ -217,4 +217,9 @@ variable "user_ocid" {
   type        = string
 }
 
+variable "scale_in_function_image" {
+  description = "OCIR image URL of the scale-in OCI Function published by OpenVidu. Example: mad.ocir.io/openvidu/<version>/openvidu-scalein:latest"
+  type        = string
+}
+
 
