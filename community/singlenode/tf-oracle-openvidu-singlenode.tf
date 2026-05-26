@@ -492,6 +492,160 @@ locals {
   bucket_name      = local.isEmptyBucketName ? oci_objectstorage_bucket.openvidu_bucket[0].name : var.bucketName
   bucket_namespace = data.oci_objectstorage_namespace.ns.namespace
 
+  # Common OCI Vault helpers, sourced by store_secret / update_config_from_secret /
+  # update_secret_from_config. Keeps a single source of truth for retry, query
+  # sanitization, and read/write logic against the vault.
+  oci_helpers_script = <<-EOF
+#!/bin/bash
+# Common OCI Vault helpers. Sourced by store_secret.sh, update_config_from_secret.sh,
+# and update_secret_from_config.sh. Callers must set VAULT_ID and COMPARTMENT_ID
+# before sourcing; KEY_ID is required only when creating new secrets via
+# store_in_vault.
+#
+# We own retry instead of relying on the OCI CLI default: the default strategy
+# can spin internally for ~10 min on 429/5xx and stack under our own retry,
+# producing 20-30 min hangs during install.
+
+# Per-attempt wall-clock cap. Vault ops typically finish in <5s; longer means
+# the API or auth layer is wedged — kill and let oci_with_retry decide.
+: "$${OCI_CALL_TIMEOUT:=45}"
+
+oci_with_retry() {
+  local max_attempts=3
+  local attempt=0
+  local delay=5
+  local stderr_file
+  stderr_file=$(mktemp)
+  while true; do
+    attempt=$((attempt + 1))
+    if output=$(timeout "$OCI_CALL_TIMEOUT" "$@" 2>"$stderr_file"); then
+      rm -f "$stderr_file"
+      echo "$output"
+      return 0
+    fi
+    if [[ $attempt -ge $max_attempts ]]; then
+      cat "$stderr_file" >&2
+      rm -f "$stderr_file"
+      return 1
+    fi
+    echo "[oci-helpers] OCI API call failed (attempt $attempt/$max_attempts), retrying in $${delay}s..." >&2
+    sleep "$delay"
+    delay=$((delay * 2))
+  done
+}
+
+# OCI CLI --raw-output prints "Query returned empty result, no output to show."
+# to stdout instead of an empty string when JMESPath matches nothing. Filter
+# that so callers can test with [[ -z ]].
+ocid_from_query() {
+  local result
+  result=$("$@")
+  if [[ "$result" == *"Query returned empty result"* || "$result" == "null" ]]; then
+    echo ""
+  else
+    echo "$result"
+  fi
+}
+
+# Read an ACTIVE secret by name. Decoded value goes to stdout; returns non-zero
+# if not found (so callers using `$(get_from_vault X)` see empty + nonzero).
+get_from_vault() {
+  local secret_name="$1"
+  local secret_id
+  secret_id=$(ocid_from_query oci_with_retry oci vault secret list \
+    --compartment-id "$COMPARTMENT_ID" \
+    --vault-id "$VAULT_ID" \
+    --all \
+    --query "data[?\"secret-name\"=='$secret_name' && \"lifecycle-state\"=='ACTIVE'].id | [0]" \
+    --raw-output \
+    --auth instance_principal)
+  if [[ -z "$secret_id" ]]; then
+    echo "[oci-helpers] Secret '$secret_name' not found in vault" >&2
+    return 1
+  fi
+  oci_with_retry oci secrets secret-bundle get \
+    --secret-id "$secret_id" \
+    --query 'data."secret-bundle-content".content' \
+    --raw-output \
+    --auth instance_principal | base64 -d
+}
+
+# Store or update a secret in the vault.
+# Fast path: ACTIVE → update. Avoids cancel-secret-deletion on every call so we
+# stay below the 30/min vault rate limit. PENDING_DELETION fallback recovers
+# from manual schedule-deletion or external tooling. Create requires KEY_ID.
+store_in_vault() {
+  local secret_name="$1"
+  local secret_value="$2"
+  local encoded_value
+  encoded_value=$(echo -n "$secret_value" | base64)
+
+  local secret_id
+
+  secret_id=$(ocid_from_query oci_with_retry oci vault secret list \
+    --compartment-id "$COMPARTMENT_ID" \
+    --vault-id "$VAULT_ID" \
+    --all \
+    --query "data[?\"secret-name\"=='$secret_name' && \"lifecycle-state\"=='ACTIVE'].id | [0]" \
+    --raw-output \
+    --auth instance_principal)
+
+  if [[ -n "$secret_id" ]]; then
+    oci_with_retry oci vault secret update-base64 \
+      --secret-id "$secret_id" \
+      --secret-content-content "$encoded_value" \
+      --enable-auto-generation false \
+      --auth instance_principal > /dev/null
+    return
+  fi
+
+  # PENDING_DELETION fallback — cancel and wait for ACTIVE; otherwise update
+  # races against CANCELLING_DELETION and OCI returns 409.
+  secret_id=$(ocid_from_query oci_with_retry oci vault secret list \
+    --compartment-id "$COMPARTMENT_ID" \
+    --vault-id "$VAULT_ID" \
+    --all \
+    --query "data[?\"secret-name\"=='$secret_name' && \"lifecycle-state\"=='PENDING_DELETION'].id | [0]" \
+    --raw-output \
+    --auth instance_principal)
+
+  if [[ -n "$secret_id" ]]; then
+    oci_with_retry oci vault secret cancel-secret-deletion \
+      --secret-id "$secret_id" \
+      --auth instance_principal > /dev/null
+    local i state=""
+    for i in $(seq 1 30); do
+      state=$(oci_with_retry oci vault secret get \
+        --secret-id "$secret_id" \
+        --query 'data."lifecycle-state"' \
+        --raw-output \
+        --auth instance_principal 2>/dev/null || echo "")
+      [[ "$state" == "ACTIVE" ]] && break
+      sleep 2
+    done
+    oci_with_retry oci vault secret update-base64 \
+      --secret-id "$secret_id" \
+      --secret-content-content "$encoded_value" \
+      --enable-auto-generation false \
+      --auth instance_principal > /dev/null
+    return
+  fi
+
+  if [[ -z "$${KEY_ID:-}" ]]; then
+    echo "[oci-helpers] Cannot create '$secret_name': KEY_ID not set" >&2
+    return 1
+  fi
+  oci_with_retry oci vault secret create-base64 \
+    --compartment-id "$COMPARTMENT_ID" \
+    --secret-name "$secret_name" \
+    --vault-id "$VAULT_ID" \
+    --key-id "$KEY_ID" \
+    --secret-content-content "$encoded_value" \
+    --secret-content-name "$secret_name" \
+    --auth instance_principal > /dev/null
+}
+EOF
+
   install_script = <<-EOF
 #!/bin/bash -x
 set -e
@@ -616,10 +770,15 @@ COMMON_ARGS=(
   "--grafana-admin-user=$GRAFANA_ADMIN_USERNAME"
   "--grafana-admin-password=$GRAFANA_ADMIN_PASSWORD"
   "--meet-initial-admin-password=$MEET_INITIAL_ADMIN_PASSWORD"
-  "--meet-initial-api-key=$MEET_INITIAL_API_KEY"
   "--livekit-api-key=$LIVEKIT_API_KEY"
   "--livekit-api-secret=$LIVEKIT_API_SECRET"
 )
+
+# Only pass --meet-initial-api-key when the user provided one. Passing an empty
+# value would explicitly null out the installer default.
+if [[ "${var.initialMeetApiKey}" != '' ]]; then
+  COMMON_ARGS+=("--meet-initial-api-key=$MEET_INITIAL_API_KEY")
+fi
 
 # Include additional installer flags provided by the user
 if [[ "${var.additionalInstallFlags}" != "" ]]; then
@@ -692,15 +851,17 @@ EOF
 #!/bin/bash
 set -e
 
-# Generate URLs
-DOMAIN="$(oci secrets secret-bundle get --secret-id $(oci vault secret list --compartment-id ${var.compartment_ocid} --vault-id ${var.vault_ocid != "" ? var.vault_ocid : oci_kms_vault.openvidu_vault[0].id} --all --query "data[?\"secret-name\"=='DOMAIN_NAME'].id | [0]" --raw-output --auth instance_principal) --query 'data."secret-bundle-content".content' --raw-output --auth instance_principal | base64 -d)"
+export HOME="/root"
+export PATH="$PATH:$HOME/.local/bin"
+
+# Generate URLs derived from the domain stored in vault
+DOMAIN="$(/usr/local/bin/store_secret.sh get DOMAIN_NAME)"
 OPENVIDU_URL="https://$${DOMAIN}/"
 LIVEKIT_URL="wss://$${DOMAIN}/"
 DASHBOARD_URL="https://$${DOMAIN}/dashboard/"
 GRAFANA_URL="https://$${DOMAIN}/grafana/"
 MINIO_URL="https://$${DOMAIN}/minio-console/"
 
-# Update shared secret
 /usr/local/bin/store_secret.sh save OPENVIDU_URL "$OPENVIDU_URL"
 /usr/local/bin/store_secret.sh save LIVEKIT_URL "$LIVEKIT_URL"
 /usr/local/bin/store_secret.sh save DASHBOARD_URL "$DASHBOARD_URL"
@@ -712,57 +873,46 @@ EOF
 #!/bin/bash -x
 set -e
 
-# Installation directory
+export HOME="/root"
+export PATH="$PATH:$HOME/.local/bin"
+export OCI_CLI_DISABLE_DEFAULT_RETRY=True
+
+VAULT_ID="${var.vault_ocid != "" ? var.vault_ocid : oci_kms_vault.openvidu_vault[0].id}"
+KEY_ID="${var.key_ocid != "" ? var.key_ocid : oci_kms_key.openvidu_key[0].id}"
+COMPARTMENT_ID="${var.compartment_ocid}"
+
+# shellcheck source=/dev/null
+. /usr/local/bin/oci_helpers.sh
+
 INSTALL_DIR="/opt/openvidu"
 CONFIG_DIR="$${INSTALL_DIR}/config"
 
-# Helper function to get secret value from OCI Vault
-get_secret() {
-  local secret_name="$1"
-  local secret_id=$(oci vault secret list --compartment-id ${var.compartment_ocid} --vault-id ${var.vault_ocid != "" ? var.vault_ocid : oci_kms_vault.openvidu_vault[0].id} --all --query "data[?\"secret-name\"=='$secret_name'].id | [0]" --raw-output --auth instance_principal)
-  oci secrets secret-bundle get --secret-id "$secret_id" --query 'data."secret-bundle-content".content' --raw-output --auth instance_principal | base64 -d
-}
-
-# Helper function to update secret value in OCI Vault
-update_secret() {
-  local secret_name="$1"
-  local secret_value="$2"
-  local secret_id
-  secret_id=$(oci vault secret list --compartment-id ${var.compartment_ocid} --vault-id ${var.vault_ocid != "" ? var.vault_ocid : oci_kms_vault.openvidu_vault[0].id} --all --query "data[?\"secret-name\"=='$secret_name' && \"lifecycle-state\"=='ACTIVE'].id | [0]" --raw-output --auth instance_principal)
-  if [[ -z "$secret_id" || "$secret_id" == "null" ]]; then
-    echo "Secret $secret_name not found in vault" >&2
-    return 1
-  fi
-  oci vault secret update-base64 --secret-id "$secret_id" --secret-content-content "$(echo -n "$secret_value" | base64)" --enable-auto-generation false --auth instance_principal
-}
-
-# Replace DOMAIN_NAME
-export DOMAIN=$(get_secret DOMAIN_NAME)
-if [[ -n "$DOMAIN" ]]; then
-    sed -i "s/DOMAIN_NAME=.*/DOMAIN_NAME=$DOMAIN/" "$${CONFIG_DIR}/openvidu.env"
-else
+# Replace DOMAIN_NAME first (everything else depends on it)
+export DOMAIN=$(get_from_vault DOMAIN_NAME)
+if [[ -z "$DOMAIN" ]]; then
     exit 1
 fi
+sed -i "s/DOMAIN_NAME=.*/DOMAIN_NAME=$DOMAIN/" "$${CONFIG_DIR}/openvidu.env"
 
 # Get the rest of the values
-export REDIS_PASSWORD=$(get_secret REDIS_PASSWORD)
-export MONGO_ADMIN_USERNAME=$(get_secret MONGO_ADMIN_USERNAME)
-export MONGO_ADMIN_PASSWORD=$(get_secret MONGO_ADMIN_PASSWORD)
-export MONGO_REPLICA_SET_KEY=$(get_secret MONGO_REPLICA_SET_KEY)
-export DASHBOARD_ADMIN_USERNAME=$(get_secret DASHBOARD_ADMIN_USERNAME)
-export DASHBOARD_ADMIN_PASSWORD=$(get_secret DASHBOARD_ADMIN_PASSWORD)
-export MINIO_ACCESS_KEY=$(get_secret MINIO_ACCESS_KEY)
-export MINIO_SECRET_KEY=$(get_secret MINIO_SECRET_KEY)
-export GRAFANA_ADMIN_USERNAME=$(get_secret GRAFANA_ADMIN_USERNAME)
-export GRAFANA_ADMIN_PASSWORD=$(get_secret GRAFANA_ADMIN_PASSWORD)
-export LIVEKIT_API_KEY=$(get_secret LIVEKIT_API_KEY)
-export LIVEKIT_API_SECRET=$(get_secret LIVEKIT_API_SECRET)
-export MEET_INITIAL_ADMIN_USER=$(get_secret MEET_INITIAL_ADMIN_USER)
-export MEET_INITIAL_ADMIN_PASSWORD=$(get_secret MEET_INITIAL_ADMIN_PASSWORD)
+export REDIS_PASSWORD=$(get_from_vault REDIS_PASSWORD)
+export MONGO_ADMIN_USERNAME=$(get_from_vault MONGO_ADMIN_USERNAME)
+export MONGO_ADMIN_PASSWORD=$(get_from_vault MONGO_ADMIN_PASSWORD)
+export MONGO_REPLICA_SET_KEY=$(get_from_vault MONGO_REPLICA_SET_KEY)
+export DASHBOARD_ADMIN_USERNAME=$(get_from_vault DASHBOARD_ADMIN_USERNAME)
+export DASHBOARD_ADMIN_PASSWORD=$(get_from_vault DASHBOARD_ADMIN_PASSWORD)
+export MINIO_ACCESS_KEY=$(get_from_vault MINIO_ACCESS_KEY)
+export MINIO_SECRET_KEY=$(get_from_vault MINIO_SECRET_KEY)
+export GRAFANA_ADMIN_USERNAME=$(get_from_vault GRAFANA_ADMIN_USERNAME)
+export GRAFANA_ADMIN_PASSWORD=$(get_from_vault GRAFANA_ADMIN_PASSWORD)
+export LIVEKIT_API_KEY=$(get_from_vault LIVEKIT_API_KEY)
+export LIVEKIT_API_SECRET=$(get_from_vault LIVEKIT_API_SECRET)
+export MEET_INITIAL_ADMIN_USER=$(get_from_vault MEET_INITIAL_ADMIN_USER)
+export MEET_INITIAL_ADMIN_PASSWORD=$(get_from_vault MEET_INITIAL_ADMIN_PASSWORD)
 if [[ "${var.initialMeetApiKey}" != '' ]]; then
-  export MEET_INITIAL_API_KEY=$(get_secret MEET_INITIAL_API_KEY)
+  export MEET_INITIAL_API_KEY=$(get_from_vault MEET_INITIAL_API_KEY)
 fi
-export ENABLED_MODULES=$(get_secret ENABLED_MODULES)
+export ENABLED_MODULES=$(get_from_vault ENABLED_MODULES)
 
 # Replace rest of the values
 sed -i "s/REDIS_PASSWORD=.*/REDIS_PASSWORD=$REDIS_PASSWORD/" "$${CONFIG_DIR}/openvidu.env"
@@ -784,44 +934,53 @@ if [[ "${var.initialMeetApiKey}" != '' ]]; then
 fi
 sed -i "s/ENABLED_MODULES=.*/ENABLED_MODULES=$ENABLED_MODULES/" "$${CONFIG_DIR}/openvidu.env"
 
-# Update URLs in secret
+# Update URLs derived from the (possibly user-edited) domain
 OPENVIDU_URL="https://$${DOMAIN}/"
 LIVEKIT_URL="wss://$${DOMAIN}/"
 DASHBOARD_URL="https://$${DOMAIN}/dashboard/"
 GRAFANA_URL="https://$${DOMAIN}/grafana/"
 MINIO_URL="https://$${DOMAIN}/minio-console/"
 
-# Update shared secrets
-update_secret DOMAIN_NAME "$DOMAIN"
-update_secret OPENVIDU_URL "$OPENVIDU_URL"
-update_secret LIVEKIT_URL "$LIVEKIT_URL"
-update_secret DASHBOARD_URL "$DASHBOARD_URL"
-update_secret GRAFANA_URL "$GRAFANA_URL"
-update_secret MINIO_URL "$MINIO_URL"
+store_in_vault DOMAIN_NAME "$DOMAIN"
+store_in_vault OPENVIDU_URL "$OPENVIDU_URL"
+store_in_vault LIVEKIT_URL "$LIVEKIT_URL"
+store_in_vault DASHBOARD_URL "$DASHBOARD_URL"
+store_in_vault GRAFANA_URL "$GRAFANA_URL"
+store_in_vault MINIO_URL "$MINIO_URL"
 EOF
 
   update_secret_from_config_script = <<-EOF
 #!/bin/bash -x
 set -e
 
-# Installation directory
+export HOME="/root"
+export PATH="$PATH:$HOME/.local/bin"
+export OCI_CLI_DISABLE_DEFAULT_RETRY=True
+
+VAULT_ID="${var.vault_ocid != "" ? var.vault_ocid : oci_kms_vault.openvidu_vault[0].id}"
+KEY_ID="${var.key_ocid != "" ? var.key_ocid : oci_kms_key.openvidu_key[0].id}"
+COMPARTMENT_ID="${var.compartment_ocid}"
+
+# shellcheck source=/dev/null
+. /usr/local/bin/oci_helpers.sh
+
 INSTALL_DIR="/opt/openvidu"
 CONFIG_DIR="$${INSTALL_DIR}/config"
 
-# Helper function to update secret value in OCI Vault
-update_secret() {
-  local secret_name="$1"
-  local secret_value="$2"
-  local secret_id
-  secret_id=$(oci vault secret list --compartment-id ${var.compartment_ocid} --vault-id ${var.vault_ocid != "" ? var.vault_ocid : oci_kms_vault.openvidu_vault[0].id} --all --query "data[?\"secret-name\"=='$secret_name' && \"lifecycle-state\"=='ACTIVE'].id | [0]" --raw-output --auth instance_principal)
-  if [[ -z "$secret_id" || "$secret_id" == "null" ]]; then
-    echo "Secret $secret_name not found in vault" >&2
-    return 1
+# Skip writes when the config didn't yield a real value. Without this, an
+# unset / commented-out config key gets persisted to vault as the literal
+# string we'd otherwise have written ("" or "none"), corrupting the secret.
+maybe_save() {
+  local key="$1"
+  local value="$2"
+  if [[ -z "$value" || "$value" == "none" ]]; then
+    echo "[update_secret_from_config] Skipping '$key': empty value in config" >&2
+    return 0
   fi
-  oci vault secret update-base64 --secret-id "$secret_id" --secret-content-content "$(echo -n "$secret_value" | base64)" --enable-auto-generation false --auth instance_principal
+  store_in_vault "$key" "$value"
 }
 
-# Get current values of the config
+# Read current values from the env files
 REDIS_PASSWORD="$(/usr/local/bin/get_value_from_config.sh REDIS_PASSWORD "$${CONFIG_DIR}/openvidu.env")"
 DOMAIN_NAME="$(/usr/local/bin/get_value_from_config.sh DOMAIN_NAME "$${CONFIG_DIR}/openvidu.env")"
 MONGO_ADMIN_USERNAME="$(/usr/local/bin/get_value_from_config.sh MONGO_ADMIN_USERNAME "$${CONFIG_DIR}/openvidu.env")"
@@ -842,26 +1001,25 @@ if [[ "${var.initialMeetApiKey}" != '' ]]; then
 fi
 ENABLED_MODULES="$(/usr/local/bin/get_value_from_config.sh ENABLED_MODULES "$${CONFIG_DIR}/openvidu.env")"
 
-# Update secrets in OCI Vault
-update_secret REDIS_PASSWORD "$REDIS_PASSWORD"
-update_secret DOMAIN_NAME "$DOMAIN_NAME"
-update_secret MONGO_ADMIN_USERNAME "$MONGO_ADMIN_USERNAME"
-update_secret MONGO_ADMIN_PASSWORD "$MONGO_ADMIN_PASSWORD"
-update_secret MONGO_REPLICA_SET_KEY "$MONGO_REPLICA_SET_KEY"
-update_secret MINIO_ACCESS_KEY "$MINIO_ACCESS_KEY"
-update_secret MINIO_SECRET_KEY "$MINIO_SECRET_KEY"
-update_secret DASHBOARD_ADMIN_USERNAME "$DASHBOARD_ADMIN_USERNAME"
-update_secret DASHBOARD_ADMIN_PASSWORD "$DASHBOARD_ADMIN_PASSWORD"
-update_secret GRAFANA_ADMIN_USERNAME "$GRAFANA_ADMIN_USERNAME"
-update_secret GRAFANA_ADMIN_PASSWORD "$GRAFANA_ADMIN_PASSWORD"
-update_secret LIVEKIT_API_KEY "$LIVEKIT_API_KEY"
-update_secret LIVEKIT_API_SECRET "$LIVEKIT_API_SECRET"
-update_secret MEET_INITIAL_ADMIN_USER "$MEET_INITIAL_ADMIN_USER"
-update_secret MEET_INITIAL_ADMIN_PASSWORD "$MEET_INITIAL_ADMIN_PASSWORD"
+maybe_save REDIS_PASSWORD "$REDIS_PASSWORD"
+maybe_save DOMAIN_NAME "$DOMAIN_NAME"
+maybe_save MONGO_ADMIN_USERNAME "$MONGO_ADMIN_USERNAME"
+maybe_save MONGO_ADMIN_PASSWORD "$MONGO_ADMIN_PASSWORD"
+maybe_save MONGO_REPLICA_SET_KEY "$MONGO_REPLICA_SET_KEY"
+maybe_save MINIO_ACCESS_KEY "$MINIO_ACCESS_KEY"
+maybe_save MINIO_SECRET_KEY "$MINIO_SECRET_KEY"
+maybe_save DASHBOARD_ADMIN_USERNAME "$DASHBOARD_ADMIN_USERNAME"
+maybe_save DASHBOARD_ADMIN_PASSWORD "$DASHBOARD_ADMIN_PASSWORD"
+maybe_save GRAFANA_ADMIN_USERNAME "$GRAFANA_ADMIN_USERNAME"
+maybe_save GRAFANA_ADMIN_PASSWORD "$GRAFANA_ADMIN_PASSWORD"
+maybe_save LIVEKIT_API_KEY "$LIVEKIT_API_KEY"
+maybe_save LIVEKIT_API_SECRET "$LIVEKIT_API_SECRET"
+maybe_save MEET_INITIAL_ADMIN_USER "$MEET_INITIAL_ADMIN_USER"
+maybe_save MEET_INITIAL_ADMIN_PASSWORD "$MEET_INITIAL_ADMIN_PASSWORD"
 if [[ "${var.initialMeetApiKey}" != '' ]]; then
-  update_secret MEET_INITIAL_API_KEY "$MEET_INITIAL_API_KEY"
+  maybe_save MEET_INITIAL_API_KEY "$MEET_INITIAL_API_KEY"
 fi
-update_secret ENABLED_MODULES "$ENABLED_MODULES"
+maybe_save ENABLED_MODULES "$ENABLED_MODULES"
 EOF
 
   get_value_from_config_script = <<-EOF
@@ -903,89 +1061,16 @@ set -e
 
 export HOME="/root"
 export PATH="$PATH:$HOME/.local/bin"
+export OCI_CLI_DISABLE_DEFAULT_RETRY=True
 
 VAULT_ID="${var.vault_ocid != "" ? var.vault_ocid : oci_kms_vault.openvidu_vault[0].id}"
 KEY_ID="${var.key_ocid != "" ? var.key_ocid : oci_kms_key.openvidu_key[0].id}"
 COMPARTMENT_ID="${var.compartment_ocid}"
 
-# Helper: run an OCI CLI command with automatic retry on transient errors
-oci_with_retry() {
-  local max_attempts=5
-  local attempt=0
-  local delay=10
-  local stderr_file
-  stderr_file=$(mktemp)
-  while true; do
-    attempt=$((attempt + 1))
-    if output=$("$@" 2>"$stderr_file"); then
-      rm -f "$stderr_file"
-      echo "$output"
-      return 0
-    fi
-    if [[ $attempt -ge $max_attempts ]]; then
-      cat "$stderr_file" >&2
-      rm -f "$stderr_file"
-      return 1
-    fi
-    echo "[store_secret] OCI API call failed (attempt $attempt/$max_attempts), retrying in $${delay}s..." >&2
-    sleep "$delay"
-    delay=$((delay * 2))
-  done
-}
+# shellcheck source=/dev/null
+. /usr/local/bin/oci_helpers.sh
 
-# Helper: sanitize OCI CLI --raw-output when JMESPath returns no match.
-# OCI CLI prints "Query returned empty result, no output to show." to stdout
-# instead of an empty string when the query matches nothing.
-ocid_from_query() {
-  local result
-  result=$("$@")
-  if [[ "$result" == *"Query returned empty result"* || "$result" == "null" ]]; then
-    echo ""
-  else
-    echo "$result"
-  fi
-}
-
-# Helper: store or update a secret in OCI Vault via Instance Principal
-store_in_vault() {
-  local secret_name="$1"
-  local secret_value="$2"
-  local encoded_value
-  encoded_value=$(echo -n "$secret_value" | base64)
-
-  local secret_id
-  secret_id=$(ocid_from_query oci_with_retry oci vault secret list \
-    --compartment-id "$COMPARTMENT_ID" \
-    --vault-id "$VAULT_ID" \
-    --all \
-    --query "data[?\"secret-name\"=='$secret_name'].id | [0]" \
-    --raw-output \
-    --auth instance_principal)
-
-  if [[ -z "$secret_id" ]]; then
-    oci_with_retry oci vault secret create-base64 \
-      --compartment-id "$COMPARTMENT_ID" \
-      --secret-name "$secret_name" \
-      --vault-id "$VAULT_ID" \
-      --key-id "$KEY_ID" \
-      --secret-content-content "$encoded_value" \
-      --secret-content-name "$secret_name" \
-      --auth instance_principal > /dev/null
-  else
-    oci vault secret cancel-secret-deletion \
-      --secret-id "$secret_id" \
-      --auth instance_principal > /dev/null 2>&1 || true
-    oci_with_retry oci vault secret update-base64 \
-      --secret-id "$secret_id" \
-      --secret-content-content "$encoded_value" \
-      --enable-auto-generation false \
-      --auth instance_principal > /dev/null
-  fi
-}
-
-# Modes: save, generate
 MODE="$1"
-
 if [[ "$MODE" == "generate" ]]; then
   SECRET_KEY_NAME="$2"
   PREFIX="$${3:-}"
@@ -993,21 +1078,17 @@ if [[ "$MODE" == "generate" ]]; then
   RANDOM_PASSWORD="$(openssl rand -base64 64 | tr -d '+/=\n' | cut -c -$${LENGTH})"
   RANDOM_PASSWORD="$${PREFIX}$${RANDOM_PASSWORD}"
   store_in_vault "$SECRET_KEY_NAME" "$RANDOM_PASSWORD"
-  if [[ $? -ne 0 ]]; then
-    echo "Error generating secret" >&2
-    exit 1
-  fi
   echo "$RANDOM_PASSWORD"
 elif [[ "$MODE" == "save" ]]; then
   SECRET_KEY_NAME="$2"
   SECRET_VALUE="$3"
   store_in_vault "$SECRET_KEY_NAME" "$SECRET_VALUE"
-  if [[ $? -ne 0 ]]; then
-    echo "Error saving secret" >&2
-    exit 1
-  fi
   echo "$SECRET_VALUE"
+elif [[ "$MODE" == "get" ]]; then
+  SECRET_KEY_NAME="$2"
+  get_from_vault "$SECRET_KEY_NAME"
 else
+  echo "Usage: $0 {generate|save|get} SECRET_NAME [VALUE|PREFIX] [LENGTH]" >&2
   exit 1
 fi
 EOF
@@ -1075,6 +1156,12 @@ ${local.after_install_script}
 AFTER_INSTALL_EOF
   chmod +x /usr/local/bin/after_install.sh
 
+  # oci_helpers.sh — must come BEFORE the scripts that source it
+  cat > /usr/local/bin/oci_helpers.sh << 'OCI_HELPERS_EOF'
+${local.oci_helpers_script}
+OCI_HELPERS_EOF
+  chmod +x /usr/local/bin/oci_helpers.sh
+
   # update_config_from_secret.sh
   cat > /usr/local/bin/update_config_from_secret.sh << 'UPDATE_CONFIG_EOF'
 ${local.update_config_from_secret_script}
@@ -1111,22 +1198,20 @@ ${local.config_s3_script}
 CONFIG_S3_EOF
   chmod +x /usr/local/bin/config_s3.sh
 
-echo "DPkg::Lock::Timeout \"-1\";" > /etc/apt/apt.conf.d/99timeout
-# Install dependencies
-apt-get update && apt-get install -y \
-  curl \
-  python3-pip \
-  jq \
-  wget \
-  ca-certificates \
-  gnupg \
-  lsb-release \
-  openssl \
-  pipx \
-  firewalld
+  echo "DPkg::Lock::Timeout \"-1\";" > /etc/apt/apt.conf.d/99timeout
+  apt-get update && apt-get install -y \
+    curl \
+    python3-pip \
+    jq \
+    wget \
+    ca-certificates \
+    gnupg \
+    lsb-release \
+    openssl \
+    pipx \
+    firewalld
 
-  # Install pipx and OCI CLI via pipx (The correct way for modern Linux)
-  apt-get update && apt-get install -y pipx
+  # Install OCI CLI via pipx (correct method for modern Ubuntu)
   OCI_CLI_VERSION="3.83.0"
   pipx install oci-cli==$${OCI_CLI_VERSION}
   
