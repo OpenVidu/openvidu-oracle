@@ -78,17 +78,57 @@ def _parse_body(data) -> dict:
 def _handle_terminate(ctx, signer, instance_id: str):
     """Terminate an instance on behalf of a draining media node.
 
-    Resource Principal auth (the function's own identity) bypasses the
-    tenancy-level deny policy that prevents instance_principal from
-    terminating compute instances.
+    Identity model — a node may ONLY ask to terminate itself.
+    OCI Functions injects the authenticated caller's identity into the
+    request headers AFTER signature validation:
+        oci-subject-type  = "instance" | "user" | "service" | ...
+        oci-subject-id    = OCID of the calling principal
+    For Instance Principal callers these are the instance's own OCID. They
+    cannot be spoofed by the caller — the OCI service overwrites them.
+    We refuse anything that doesn't match the body's terminate_instance_id.
+
+    Resource Principal auth on the actual TerminateInstance call (the
+    function's own identity) is still needed to bypass the tenancy-level
+    deny policy that blocks instance_principal from terminating compute.
     """
-    logger.info("Direct terminate request for instance: %s", instance_id)
+    headers     = {k.lower(): v for k, v in (ctx.Headers() or {}).items()}
+    caller_id   = headers.get("oci-subject-id", "")
+    caller_type = headers.get("oci-subject-type", "")
+
+    if caller_type != "instance":
+        logger.warning(
+            "Refusing terminate: caller is not an instance (type=%r, id=%r).",
+            caller_type, caller_id,
+        )
+        return _refused(ctx, f"caller_not_instance:{caller_type or 'unknown'}", instance_id)
+
+    if caller_id != instance_id:
+        logger.warning(
+            "Refusing terminate: caller %s tried to terminate %s.",
+            caller_id, instance_id,
+        )
+        return _refused(ctx, "caller_target_mismatch", instance_id)
+
+    logger.info("Authorized self-terminate for instance: %s", instance_id)
     compute = oci.core.ComputeClient(config={}, signer=signer)
     compute.terminate_instance(instance_id, preserve_boot_volume=False)
     logger.info("Terminate submitted for instance: %s", instance_id)
     return response.Response(
         ctx,
         response_data=json.dumps({"action": "terminated", "instance_id": instance_id}),
+        headers={"Content-Type": "application/json"},
+    )
+
+
+def _refused(ctx, reason: str, instance_id: str):
+    return response.Response(
+        ctx,
+        response_data=json.dumps({
+            "action":      "refused",
+            "reason":      reason,
+            "instance_id": instance_id,
+        }),
+        status_code=403,
         headers={"Content-Type": "application/json"},
     )
 
