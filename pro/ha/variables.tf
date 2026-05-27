@@ -1,6 +1,5 @@
 # ------------------------- variables -------------------------
 
-# Variables used by the configuration
 variable "tenancy_ocid" {
   description = "OCI Tenancy OCID. Required for Object Storage namespace and image lookup."
   type        = string
@@ -125,13 +124,13 @@ variable "mediaNodeShape" {
 variable "mediaNodeOcpus" {
   description = "Number of OCPUs for Media Nodes (if using Flex shape)."
   type        = number
-  default     = 4
+  default     = 3
 }
 
 variable "mediaNodeMemory" {
   description = "Memory in GB for Media Nodes (if using Flex shape)."
   type        = number
-  default     = 16
+  default     = 4
 }
 
 variable "mediaNodeDiskSize" {
@@ -164,14 +163,16 @@ variable "scaleTargetCPU" {
   default     = 50
 }
 
+# HA uses TWO buckets: app-data (recordings + user files) and cluster-data
+# (shared cluster state, SSH key). Mirrors AWS/GCP HA reference.
 variable "bucketAppDataName" {
-  description = "Name of the OCI Object Storage bucket for application data and recordings. If empty, a bucket will be created."
+  description = "Name of an existing OCI Object Storage bucket for application data and recordings. If empty, a new bucket will be created."
   type        = string
   default     = ""
 }
 
 variable "bucketClusterDataName" {
-  description = "Name of the OCI Object Storage bucket for cluster data. If empty, a bucket will be created."
+  description = "Name of an existing OCI Object Storage bucket for cluster-wide shared state. If empty, a new bucket will be created."
   type        = string
   default     = ""
 }
@@ -216,5 +217,10 @@ variable "key_ocid" {
 
 variable "user_ocid" {
   description = "OCI User OCID used to create Customer Secret Keys for S3-compatible access to Object Storage."
+  type        = string
+}
+
+variable "scale_in_function_image" {
+  description = "OCIR image URL of the scale-in OCI Function published by OpenVidu. Example: mad.ocir.io/openvidu/openvidu-scalein:main"
   type        = string
 }

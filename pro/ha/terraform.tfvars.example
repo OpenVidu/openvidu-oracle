@@ -1,20 +1,173 @@
-tenancy_ocid     = "ocid1.tenancy.oc1..your-tenancy-ocid"
-compartment_ocid = "ocid1.compartment.oc1..your-compartment-ocid"
-stackName        = "ov-ha"
-region           = "eu-madrid-1"
-user_ocid        = "ocid1.user.oc1..your-user-ocid"
-openviduLicense  = "your-openvidu-license-key"
+# =================================================================
+#  REQUIRED CONFIGURATION
+#  You must fill in these variables for the deployment to work.
+# =================================================================
 
-# Optional: provide existing vault/key to avoid creating new ones
-# vault_ocid = "ocid1.vault.oc1.eu-madrid-1...."
-# key_ocid   = "ocid1.key.oc1.eu-madrid-1...."
+# Your OCI Tenancy OCID.
+# Found at: OCI Console → Profile → Tenancy → OCID
+tenancy_ocid = "ocid1.tenancy.oc1..xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
-# Optional: provide existing buckets
-# bucketAppDataName     = "my-existing-appdata-bucket"
-# bucketClusterDataName = "my-existing-clusterdata-bucket"
+# OCI Compartment OCID where all resources will be created.
+# Found at: OCI Console → Identity → Compartments → <your compartment> → OCID
+compartment_ocid = "ocid1.compartment.oc1..xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
-# Optional: provide an existing reserved public IP OCID for the NLB
-# publicIpAddress = "ocid1.publicip.oc1.eu-madrid-1...."
+# OCI User OCID used to generate S3-compatible credentials for Object Storage.
+# Found at: OCI Console → Profile → User Settings → OCID
+user_ocid = "ocid1.user.oc1..xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
-# Optional: set a custom domain name (otherwise sslip.io is used)
-# domainName = "openvidu.example.com"
+# Name to identify your deployment (e.g., "openvidu-ha").
+stackName = "openvidu-ha"
+
+# OpenVidu Pro license key.
+# Get yours at: https://openvidu.io/account
+openviduLicense = "your-openvidu-pro-license-key"
+
+# OCIR image of the scale-in OCI Function published by OpenVidu.
+# Format: <region-key>.ocir.io/<namespace>/<repo>:<tag>
+# Example: mad.ocir.io/openvidu/openvidu-scalein:main
+scale_in_function_image = "mad.ocir.io/openvidu/openvidu-scalein:main"
+
+# =================================================================
+#  OPTIONAL CONFIGURATION
+#  Uncomment (remove the #) only if you need to change the default value.
+# =================================================================
+
+# --- Region and Availability Domain ---
+
+# OCI region where resources will be created. Default: eu-frankfurt-1.
+# Examples: us-ashburn-1, us-phoenix-1, eu-amsterdam-1, ap-tokyo-1.
+# Leave commented to use the default.
+# region = "eu-frankfurt-1"
+
+# Availability Domain number (1, 2, or 3). Default: 1.
+# Leave commented to use the default.
+# availability_domain = 1
+
+
+# --- Master Node Size (4 masters in HA — all use the same shape/size) ---
+
+# OCI Shape for each Master Node. Default: VM.Standard.E4.Flex.
+# Leave commented to use the default.
+# masterNodeShape = "VM.Standard.E4.Flex"
+
+# Number of OCPUs per Master Node (only for Flex shapes). Default: 2.
+# Leave commented to use the default.
+# masterNodeOcpus = 2
+
+# Memory in GB per Master Node (only for Flex shapes). Default: 8.
+# Leave commented to use the default.
+# masterNodeMemory = 8
+
+# Boot disk size in GB for each Master Node. Default: 100.
+# Leave commented to use the default.
+# masterNodeDiskSize = 100
+
+
+# --- Media Node Size ---
+
+# OCI Shape for Media Nodes. Default: VM.Standard.E4.Flex.
+# Leave commented to use the default.
+# mediaNodeShape = "VM.Standard.E4.Flex"
+
+# Number of OCPUs for each Media Node (only for Flex shapes). Default: 3.
+# Leave commented to use the default.
+# mediaNodeOcpus = 3
+
+# Memory in GB for each Media Node (only for Flex shapes). Default: 4.
+# Leave commented to use the default.
+# mediaNodeMemory = 4
+
+# Boot disk size in GB for each Media Node. Default: 100.
+# Leave commented to use the default.
+# mediaNodeDiskSize = 100
+
+
+# --- Autoscaling ---
+
+# Number of media nodes to deploy initially. Default: 1.
+# Leave commented to use the default.
+# initialNumberOfMediaNodes = 1
+
+# Minimum number of media nodes the pool can scale down to. Default: 1.
+# Leave commented to use the default.
+# minNumberOfMediaNodes = 1
+
+# Maximum number of media nodes the pool can scale up to. Default: 5.
+# Leave commented to use the default.
+# maxNumberOfMediaNodes = 5
+
+# Target CPU percentage that triggers scale-out (above) / scale-in (below).
+# Default: 50.
+# Leave commented to use the default.
+# scaleTargetCPU = 50
+
+
+# --- Domain and SSL Certificates ---
+
+# Certificate type. Default: "letsencrypt".
+# Options:
+#   - "letsencrypt" (Recommended for production, requires domain or uses sslip.io).
+#   - "selfsigned"  (For local testing only, browser will show warning).
+#   - "owncert"     (If you already have your own certificate files).
+# Leave commented to use the default.
+# certificateType = "letsencrypt"
+
+# Your real domain name (e.g., "video.mycompany.com").
+# Required if using 'owncert'. Recommended for 'letsencrypt'.
+# Leave empty or commented to use an automatic sslip.io domain (derived from the NLB IP).
+# domainName = "video.mycompany.com"
+
+# Previously created OCI Reserved Public IP OCID to assign to the NLB.
+# Leave empty or commented to let OCI allocate a new public IP.
+# publicIpAddress = "ocid1.publicip.oc1.eu-frankfurt-1.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+# Only if using 'owncert': public certificate and private key contents in base64.
+# ownPublicCertificate  = "base64_of_your_public_certificate.pem"
+# ownPrivateCertificate = "base64_of_your_private_certificate.pem"
+
+
+# --- Security and Access ---
+
+# Password for the Meet admin user.
+# If left empty or commented, a random one will be generated (check terraform output).
+# initialMeetAdminPassword = "YourSecurePassword123"
+
+# Initial API Key for OpenVidu Meet.
+# If left empty or commented, no initial key will be configured.
+# initialMeetApiKey = "YourSecretApiKey"
+
+
+# --- Media Engine ---
+
+# RTC engine to use. Default: "pion".
+# Options: "pion" or "mediasoup".
+# Leave commented to use the default.
+# rtcEngine = "pion"
+
+
+# --- Storage (OCI Object Storage) ---
+# HA uses TWO buckets: app-data (recordings, user files) and cluster-data
+# (cluster-wide shared state and the generated SSH private key).
+
+# Name of an existing Object Storage bucket for application data.
+# If left empty or commented, a new one will be created automatically.
+# bucketAppDataName = "my-openvidu-appdata"
+
+# Name of an existing Object Storage bucket for cluster-wide shared state.
+# If left empty or commented, a new one will be created automatically.
+# bucketClusterDataName = "my-openvidu-clusterdata"
+
+
+# --- KMS Vault (Secrets Management) ---
+
+# OCID of an existing OCI KMS Vault for secrets. If empty, a new vault will be created.
+# vault_ocid = "ocid1.vault.oc1.eu-frankfurt-1.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+# OCID of an existing OCI KMS Key. If empty, a new key will be created.
+# key_ocid = "ocid1.key.oc1.eu-frankfurt-1.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+
+# --- Advanced ---
+
+# Extra flags for the OpenVidu installer (comma-separated).
+# additionalInstallFlags = "--flag1=value, --flag2"
