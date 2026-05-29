@@ -51,8 +51,8 @@ resource "tls_private_key" "openvidu_ssh_key_sn" {
 
 resource "oci_objectstorage_object" "ssh_private_key" {
   namespace = data.oci_objectstorage_namespace.ns.namespace
-  bucket    = local.isEmptyBucketName ? oci_objectstorage_bucket.openvidu_bucket[0].name : var.bucketName
-  object    = "${var.stackName}-private-key.pem"
+  bucket    = local.bucket_app_data_name
+  object    = "openvidu_private_ssh_key_${var.stackName}.pem"
   content   = tls_private_key.openvidu_ssh_key_sn.private_key_pem
 
   # Es importante que el objeto se cree después del bucket
@@ -165,15 +165,6 @@ resource "oci_core_security_list" "openvidu_sl" {
     udp_options {
       min = 7885
       max = 7885
-    }
-  }
-  ingress_security_rules {
-    protocol    = "6"
-    source      = "0.0.0.0/0"
-    description = "MinIO"
-    tcp_options {
-      min = 9000
-      max = 9000
     }
   }
   ingress_security_rules {
@@ -314,20 +305,6 @@ resource "oci_core_network_security_group_security_rule" "openvidu_nsg_ingress_l
   description = "LiveKit/WebRTC UDP"
 }
 
-resource "oci_core_network_security_group_security_rule" "openvidu_nsg_ingress_minio_tcp" {
-  network_security_group_id = oci_core_network_security_group.openvidu_nsg.id
-  direction                 = "INGRESS"
-  protocol                  = "6" #TCP
-  source                    = "0.0.0.0/0"
-  tcp_options {
-    destination_port_range {
-      min = 9000
-      max = 9000
-    }
-  }
-  description = "MinIO"
-}
-
 resource "oci_core_network_security_group_security_rule" "openvidu_nsg_ingress_webrtc_udp" {
   network_security_group_id = oci_core_network_security_group.openvidu_nsg.id
   direction                 = "INGRESS"
@@ -344,8 +321,7 @@ resource "oci_core_network_security_group_security_rule" "openvidu_nsg_ingress_w
 # ------------------------- Object Storage -------------------------
 
 locals {
-  # Only create bucket if S3 credentials are provided AND no existing bucket name
-  isEmptyBucketName = var.bucketName == ""
+  bucket_app_data_name = var.bucketName == "" ? oci_objectstorage_bucket.openvidu_bucket[0].name : var.bucketName
 }
 
 data "oci_objectstorage_namespace" "ns" {
@@ -364,7 +340,7 @@ resource "oci_identity_customer_secret_key" "openvidu_s3_key" {
 
 # Object Storage Bucket
 resource "oci_objectstorage_bucket" "openvidu_bucket" {
-  count          = local.isEmptyBucketName ? 1 : 0
+  count          = var.bucketName == "" ? 1 : 0
   compartment_id = var.compartment_ocid
   namespace      = data.oci_objectstorage_namespace.ns.namespace
   name           = "${var.stackName}-appdata-${random_id.suffix.hex}"
@@ -489,7 +465,7 @@ data "oci_kms_key" "openvidu_key" {
 # ------------------------- locals with scripts -------------------------
 
 locals {
-  bucket_name      = local.isEmptyBucketName ? oci_objectstorage_bucket.openvidu_bucket[0].name : var.bucketName
+  bucket_name      = local.bucket_app_data_name
   bucket_namespace = data.oci_objectstorage_namespace.ns.namespace
 
   # Common OCI Vault helpers, sourced by store_secret / update_config_from_secret /
@@ -738,8 +714,6 @@ REDIS_PASSWORD="$(/usr/local/bin/store_secret.sh generate REDIS_PASSWORD)"
 MONGO_ADMIN_USERNAME="$(/usr/local/bin/store_secret.sh save MONGO_ADMIN_USERNAME "mongoadmin")"
 MONGO_ADMIN_PASSWORD="$(/usr/local/bin/store_secret.sh generate MONGO_ADMIN_PASSWORD)"
 MONGO_REPLICA_SET_KEY="$(/usr/local/bin/store_secret.sh generate MONGO_REPLICA_SET_KEY)"
-MINIO_ACCESS_KEY="$(/usr/local/bin/store_secret.sh save MINIO_ACCESS_KEY "minioadmin")"
-MINIO_SECRET_KEY="$(/usr/local/bin/store_secret.sh generate MINIO_SECRET_KEY)"
 DASHBOARD_ADMIN_USERNAME="$(/usr/local/bin/store_secret.sh save DASHBOARD_ADMIN_USERNAME "dashboardadmin")"
 DASHBOARD_ADMIN_PASSWORD="$(/usr/local/bin/store_secret.sh generate DASHBOARD_ADMIN_PASSWORD)"
 GRAFANA_ADMIN_USERNAME="$(/usr/local/bin/store_secret.sh save GRAFANA_ADMIN_USERNAME "grafanaadmin")"
@@ -763,8 +737,6 @@ COMMON_ARGS=(
   "--mongo-admin-user=$MONGO_ADMIN_USERNAME"
   "--mongo-admin-password=$MONGO_ADMIN_PASSWORD"
   "--mongo-replica-set-key=$MONGO_REPLICA_SET_KEY"
-  "--minio-access-key=$MINIO_ACCESS_KEY"
-  "--minio-secret-key=$MINIO_SECRET_KEY"
   "--dashboard-admin-user=$DASHBOARD_ADMIN_USERNAME"
   "--dashboard-admin-password=$DASHBOARD_ADMIN_PASSWORD"
   "--grafana-admin-user=$GRAFANA_ADMIN_USERNAME"
@@ -860,13 +832,11 @@ OPENVIDU_URL="https://$${DOMAIN}/"
 LIVEKIT_URL="wss://$${DOMAIN}/"
 DASHBOARD_URL="https://$${DOMAIN}/dashboard/"
 GRAFANA_URL="https://$${DOMAIN}/grafana/"
-MINIO_URL="https://$${DOMAIN}/minio-console/"
 
 /usr/local/bin/store_secret.sh save OPENVIDU_URL "$OPENVIDU_URL"
 /usr/local/bin/store_secret.sh save LIVEKIT_URL "$LIVEKIT_URL"
 /usr/local/bin/store_secret.sh save DASHBOARD_URL "$DASHBOARD_URL"
 /usr/local/bin/store_secret.sh save GRAFANA_URL "$GRAFANA_URL"
-/usr/local/bin/store_secret.sh save MINIO_URL "$MINIO_URL"
 EOF
 
   update_config_from_secret_script = <<-EOF
@@ -901,8 +871,6 @@ export MONGO_ADMIN_PASSWORD=$(get_from_vault MONGO_ADMIN_PASSWORD)
 export MONGO_REPLICA_SET_KEY=$(get_from_vault MONGO_REPLICA_SET_KEY)
 export DASHBOARD_ADMIN_USERNAME=$(get_from_vault DASHBOARD_ADMIN_USERNAME)
 export DASHBOARD_ADMIN_PASSWORD=$(get_from_vault DASHBOARD_ADMIN_PASSWORD)
-export MINIO_ACCESS_KEY=$(get_from_vault MINIO_ACCESS_KEY)
-export MINIO_SECRET_KEY=$(get_from_vault MINIO_SECRET_KEY)
 export GRAFANA_ADMIN_USERNAME=$(get_from_vault GRAFANA_ADMIN_USERNAME)
 export GRAFANA_ADMIN_PASSWORD=$(get_from_vault GRAFANA_ADMIN_PASSWORD)
 export LIVEKIT_API_KEY=$(get_from_vault LIVEKIT_API_KEY)
@@ -921,8 +889,6 @@ sed -i "s/MONGO_ADMIN_PASSWORD=.*/MONGO_ADMIN_PASSWORD=$MONGO_ADMIN_PASSWORD/" "
 sed -i "s/MONGO_REPLICA_SET_KEY=.*/MONGO_REPLICA_SET_KEY=$MONGO_REPLICA_SET_KEY/" "$${CONFIG_DIR}/openvidu.env"
 sed -i "s/DASHBOARD_ADMIN_USERNAME=.*/DASHBOARD_ADMIN_USERNAME=$DASHBOARD_ADMIN_USERNAME/" "$${CONFIG_DIR}/openvidu.env"
 sed -i "s/DASHBOARD_ADMIN_PASSWORD=.*/DASHBOARD_ADMIN_PASSWORD=$DASHBOARD_ADMIN_PASSWORD/" "$${CONFIG_DIR}/openvidu.env"
-sed -i "s/MINIO_ACCESS_KEY=.*/MINIO_ACCESS_KEY=$MINIO_ACCESS_KEY/" "$${CONFIG_DIR}/openvidu.env"
-sed -i "s/MINIO_SECRET_KEY=.*/MINIO_SECRET_KEY=$MINIO_SECRET_KEY/" "$${CONFIG_DIR}/openvidu.env"
 sed -i "s/GRAFANA_ADMIN_USERNAME=.*/GRAFANA_ADMIN_USERNAME=$GRAFANA_ADMIN_USERNAME/" "$${CONFIG_DIR}/openvidu.env"
 sed -i "s/GRAFANA_ADMIN_PASSWORD=.*/GRAFANA_ADMIN_PASSWORD=$GRAFANA_ADMIN_PASSWORD/" "$${CONFIG_DIR}/openvidu.env"
 sed -i "s/LIVEKIT_API_KEY=.*/LIVEKIT_API_KEY=$LIVEKIT_API_KEY/" "$${CONFIG_DIR}/openvidu.env"
@@ -939,14 +905,12 @@ OPENVIDU_URL="https://$${DOMAIN}/"
 LIVEKIT_URL="wss://$${DOMAIN}/"
 DASHBOARD_URL="https://$${DOMAIN}/dashboard/"
 GRAFANA_URL="https://$${DOMAIN}/grafana/"
-MINIO_URL="https://$${DOMAIN}/minio-console/"
 
 store_in_vault DOMAIN_NAME "$DOMAIN"
 store_in_vault OPENVIDU_URL "$OPENVIDU_URL"
 store_in_vault LIVEKIT_URL "$LIVEKIT_URL"
 store_in_vault DASHBOARD_URL "$DASHBOARD_URL"
 store_in_vault GRAFANA_URL "$GRAFANA_URL"
-store_in_vault MINIO_URL "$MINIO_URL"
 EOF
 
   update_secret_from_config_script = <<-EOF
@@ -986,8 +950,6 @@ DOMAIN_NAME="$(/usr/local/bin/get_value_from_config.sh DOMAIN_NAME "$${CONFIG_DI
 MONGO_ADMIN_USERNAME="$(/usr/local/bin/get_value_from_config.sh MONGO_ADMIN_USERNAME "$${CONFIG_DIR}/openvidu.env")"
 MONGO_ADMIN_PASSWORD="$(/usr/local/bin/get_value_from_config.sh MONGO_ADMIN_PASSWORD "$${CONFIG_DIR}/openvidu.env")"
 MONGO_REPLICA_SET_KEY="$(/usr/local/bin/get_value_from_config.sh MONGO_REPLICA_SET_KEY "$${CONFIG_DIR}/openvidu.env")"
-MINIO_ACCESS_KEY="$(/usr/local/bin/get_value_from_config.sh MINIO_ACCESS_KEY "$${CONFIG_DIR}/openvidu.env")"
-MINIO_SECRET_KEY="$(/usr/local/bin/get_value_from_config.sh MINIO_SECRET_KEY "$${CONFIG_DIR}/openvidu.env")"
 DASHBOARD_ADMIN_USERNAME="$(/usr/local/bin/get_value_from_config.sh DASHBOARD_ADMIN_USERNAME "$${CONFIG_DIR}/openvidu.env")"
 DASHBOARD_ADMIN_PASSWORD="$(/usr/local/bin/get_value_from_config.sh DASHBOARD_ADMIN_PASSWORD "$${CONFIG_DIR}/openvidu.env")"
 GRAFANA_ADMIN_USERNAME="$(/usr/local/bin/get_value_from_config.sh GRAFANA_ADMIN_USERNAME "$${CONFIG_DIR}/openvidu.env")"
@@ -1006,8 +968,6 @@ maybe_save DOMAIN_NAME "$DOMAIN_NAME"
 maybe_save MONGO_ADMIN_USERNAME "$MONGO_ADMIN_USERNAME"
 maybe_save MONGO_ADMIN_PASSWORD "$MONGO_ADMIN_PASSWORD"
 maybe_save MONGO_REPLICA_SET_KEY "$MONGO_REPLICA_SET_KEY"
-maybe_save MINIO_ACCESS_KEY "$MINIO_ACCESS_KEY"
-maybe_save MINIO_SECRET_KEY "$MINIO_SECRET_KEY"
 maybe_save DASHBOARD_ADMIN_USERNAME "$DASHBOARD_ADMIN_USERNAME"
 maybe_save DASHBOARD_ADMIN_PASSWORD "$DASHBOARD_ADMIN_PASSWORD"
 maybe_save GRAFANA_ADMIN_USERNAME "$GRAFANA_ADMIN_USERNAME"

@@ -42,16 +42,6 @@ variable "certificateType" {
   }
 }
 
-variable "publicIpAddress" {
-  description = "Previously created Reserved Public IP OCID for the OpenVidu Deployment. Blank will generate a new public IP."
-  type        = string
-  default     = ""
-  validation {
-    condition     = can(regex("^$|^([01]?\\d{1,2}|2[0-4]\\d|25[0-5])\\.([01]?\\d{1,2}|2[0-4]\\d|25[0-5])\\.([01]?\\d{1,2}|2[0-4]\\d|25[0-5])\\.([01]?\\d{1,2}|2[0-4]\\d|25[0-5])$", var.publicIpAddress))
-    error_message = "The Public Elastic IP does not have a valid IPv4 format"
-  }
-}
-
 variable "domainName" {
   description = "Domain name for the OpenVidu Deployment."
   type        = string

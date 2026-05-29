@@ -69,10 +69,6 @@ openviduLicense = "your-openvidu-pro-license-key"
 # Leave empty or commented to use an automatic sslip.io domain.
 # domainName = "video.mycompany.com"
 
-# Previously created OCI Reserved Public IP address to assign to the instance.
-# Leave empty or commented to create a new public IP automatically.
-# publicIpAddress = "1.2.3.4"
-
 # Only if using 'owncert': public certificate and private key contents in base64.
 # ownPublicCertificate  = "base64_of_your_public_certificate.pem"
 # ownPrivateCertificate = "base64_of_your_private_certificate.pem"
