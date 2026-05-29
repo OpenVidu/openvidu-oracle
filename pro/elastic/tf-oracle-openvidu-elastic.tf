@@ -114,7 +114,6 @@ locals {
     http  = { min = 80, max = 80, label = "HTTP" }
     https = { min = 443, max = 443, label = "HTTPS" }
     rtmp  = { min = 1935, max = 1935, label = "RTMP" }
-    minio = { min = 9000, max = 9000, label = "MinIO" }
   }
 
   media_internet_ingress_tcp = {
@@ -277,7 +276,7 @@ locals {
 resource "oci_objectstorage_object" "ssh_private_key" {
   namespace = data.oci_objectstorage_namespace.ns.namespace
   bucket    = local.bucket_app_data_name
-  object    = "${var.stackName}-private-key.pem"
+  object    = "openvidu_private_ssh_key_${var.stackName}.pem"
   content   = tls_private_key.openvidu_ssh_key_elastic.private_key_pem
 
   depends_on = [oci_objectstorage_bucket.appdata_bucket]
@@ -377,6 +376,12 @@ resource "oci_core_instance" "openvidu_master_node" {
   freeform_tags = {
     "stack"     = var.stackName
     "node-type" = "master"
+    # Runtime config consumed by invoke_scalein.sh. Kept as tags (not baked
+    # into user_data) so toggling fixedNumberOfMediaNodes updates the master
+    # in place instead of recreating it (which would mean a fresh domain,
+    # vault secrets, and effectively a new deployment).
+    "scale-in-mode"  = var.fixedNumberOfMediaNodes > 0 ? "fixed" : "elastic"
+    "scale-in-fn-id" = try(oci_functions_function.scale_in_fn[0].id, "")
   }
 
   depends_on = [time_sleep.wait_for_iam_propagation]
@@ -573,7 +578,7 @@ resource "oci_core_instance_pool" "media_node_pool" {
   compartment_id            = var.compartment_ocid
   instance_configuration_id = oci_core_instance_configuration.media_node_config.id
   display_name              = "${var.stackName}-media-pool"
-  size                      = var.initialNumberOfMediaNodes
+  size                      = var.fixedNumberOfMediaNodes > 0 ? var.fixedNumberOfMediaNodes : var.initialNumberOfMediaNodes
 
   placement_configurations {
     availability_domain = data.oci_identity_availability_domain.ad.name
@@ -582,6 +587,8 @@ resource "oci_core_instance_pool" "media_node_pool" {
 }
 
 resource "oci_autoscaling_auto_scaling_configuration" "media_node_autoscaling" {
+  count = var.fixedNumberOfMediaNodes > 0 ? 0 : 1
+
   compartment_id       = var.compartment_ocid
   display_name         = "${var.stackName}-autoscaling"
   cool_down_in_seconds = 300
@@ -681,6 +688,8 @@ resource "oci_identity_policy" "media_node_predrain_policy" {
 # Required so the function can call OCI APIs (instance-pools, monitoring)
 # without embedding credentials in the image.
 resource "oci_identity_dynamic_group" "scale_in_fn_dg" {
+  count = var.fixedNumberOfMediaNodes > 0 ? 0 : 1
+
   compartment_id = var.tenancy_ocid
   name           = "${var.stackName}-scalein-fn-dg"
   description    = "Dynamic group for OpenVidu scale-in OCI Function (Resource Principal auth)"
@@ -690,17 +699,19 @@ resource "oci_identity_dynamic_group" "scale_in_fn_dg" {
 # Policy: allows the scale-in function to list/inspect/resize the media node pool
 # and to read CPU metrics from OCI Monitoring (same data source as func.py).
 resource "oci_identity_policy" "scale_in_fn_policy" {
+  count = var.fixedNumberOfMediaNodes > 0 ? 0 : 1
+
   compartment_id = var.compartment_ocid
   name           = "${var.stackName}-scalein-fn-policy"
   description    = "Allow OpenVidu scale-in OCI Function to manage media node pool size"
   statements = [
-    "allow dynamic-group ${oci_identity_dynamic_group.scale_in_fn_dg.name} to manage instance-pools in compartment id ${var.compartment_ocid}",
-    "allow dynamic-group ${oci_identity_dynamic_group.scale_in_fn_dg.name} to manage instances in compartment id ${var.compartment_ocid}",
+    "allow dynamic-group ${oci_identity_dynamic_group.scale_in_fn_dg[0].name} to manage instance-pools in compartment id ${var.compartment_ocid}",
+    "allow dynamic-group ${oci_identity_dynamic_group.scale_in_fn_dg[0].name} to manage instances in compartment id ${var.compartment_ocid}",
     # terminate-instance with preserve_boot_volume=false must delete the boot
     # volume too — without volume-family OCI rejects with "volume ... cannot
     # be terminated because this user does not have sufficient permissions".
-    "allow dynamic-group ${oci_identity_dynamic_group.scale_in_fn_dg.name} to manage volume-family in compartment id ${var.compartment_ocid}",
-    "allow dynamic-group ${oci_identity_dynamic_group.scale_in_fn_dg.name} to read metrics in compartment id ${var.compartment_ocid}",
+    "allow dynamic-group ${oci_identity_dynamic_group.scale_in_fn_dg[0].name} to manage volume-family in compartment id ${var.compartment_ocid}",
+    "allow dynamic-group ${oci_identity_dynamic_group.scale_in_fn_dg[0].name} to read metrics in compartment id ${var.compartment_ocid}",
   ]
 }
 
@@ -718,6 +729,8 @@ resource "time_sleep" "wait_for_iam_propagation" {
 # The config vars are updated by Terraform; the function reads them at invocation
 # time via os.environ — no image rebuild needed to change them.
 resource "oci_functions_application" "scale_in_app" {
+  count = var.fixedNumberOfMediaNodes > 0 ? 0 : 1
+
   compartment_id = var.compartment_ocid
   display_name   = "${var.stackName}-scalein-app"
   subnet_ids     = [oci_core_subnet.openvidu_subnet.id]
@@ -733,7 +746,9 @@ resource "oci_functions_application" "scale_in_app" {
 # Function: uses the pre-built image published by OpenVidu Team in their OCIR
 # (Option B). No docker build/push during terraform apply.
 resource "oci_functions_function" "scale_in_fn" {
-  application_id     = oci_functions_application.scale_in_app.id
+  count = var.fixedNumberOfMediaNodes > 0 ? 0 : 1
+
+  application_id     = oci_functions_application.scale_in_app[0].id
   display_name       = "${var.stackName}-scalein-fn"
   image              = var.scale_in_function_image
   memory_in_mbs      = "256"
@@ -742,6 +757,8 @@ resource "oci_functions_function" "scale_in_fn" {
 
 # Log Group: container for the scale-in function logs.
 resource "oci_logging_log_group" "scale_in_log_group" {
+  count = var.fixedNumberOfMediaNodes > 0 ? 0 : 1
+
   compartment_id = var.compartment_ocid
   display_name   = "${var.stackName}-scalein-log-group"
 }
@@ -749,14 +766,16 @@ resource "oci_logging_log_group" "scale_in_log_group" {
 # Log: captures function invocation logs (stdout/stderr from func.py).
 # service=functions, resource=application OCID, category=invoke
 resource "oci_logging_log" "scale_in_fn_log" {
+  count = var.fixedNumberOfMediaNodes > 0 ? 0 : 1
+
   display_name = "${var.stackName}-scalein-fn-log"
-  log_group_id = oci_logging_log_group.scale_in_log_group.id
+  log_group_id = oci_logging_log_group.scale_in_log_group[0].id
   log_type     = "SERVICE"
 
   configuration {
     source {
       category    = "invoke"
-      resource    = oci_functions_application.scale_in_app.id
+      resource    = oci_functions_application.scale_in_app[0].id
       service     = "functions"
       source_type = "OCISERVICE"
     }
@@ -932,6 +951,42 @@ store_in_vault() {
 }
 EOF
 
+  # get_master_tag.sh — single source of truth for runtime config that depends on
+  # var.fixedNumberOfMediaNodes. The master node carries scale-in-mode and
+  # scale-in-fn-id as freeform tags (updated in place by Terraform on toggle).
+  # Media nodes query them via OCI API instead of baking values into their
+  # user_data, which would force instance_configuration replacement on every
+  # toggle and conflict 409 because the pool still references it.
+  get_master_tag_script = <<-EOF
+#!/bin/bash
+# Read a freeform tag from this stack's master node.
+# Usage: $0 <tag-name>
+# stdout: tag value (empty string if not found or API failure).
+
+set -u
+source /etc/openvidu/predrain.conf
+
+export HOME="/root"
+export PATH="$PATH:/root/.local/bin"
+
+TAG_NAME="$${1:-}"
+[ -z "$TAG_NAME" ] && { echo "Usage: $0 <tag-name>" >&2; exit 1; }
+
+oci compute instance list \
+  --compartment-id "$COMPARTMENT_ID" \
+  --lifecycle-state RUNNING \
+  --auth instance_principal \
+  --all --output json 2>/dev/null \
+  | jq -r --arg s "$STACK_NAME" --arg t "$TAG_NAME" \
+    '.data[]
+     | select(
+         .["freeform-tags"]["stack"] == $s and
+         .["freeform-tags"]["node-type"] == "master"
+       )
+     | .["freeform-tags"][$t] // empty' 2>/dev/null \
+  | head -1
+EOF
+
   # Pre-drain daemon: polls pool membership every 30s. When this instance is
   # no longer in the pool (detached by func.py on scale-in), calls graceful_shutdown.sh.
   pre_drain_daemon_script = <<-EOF
@@ -981,7 +1036,18 @@ log "Pool discovered: $POOL_ID"
 # Poll every 30s: am I still a member of the pool?
 # When func.py detaches this instance (is_decrement_size=True), it disappears
 # from the pool member list — that is our drain signal.
+#
+# In fixed-mode deployments there is no scale-in function and no detach events,
+# so we skip the membership check. The check is re-evaluated every iteration
+# so toggling between modes via Terraform takes effect without restarting the
+# daemon (worst case: one minute of staleness).
 while true; do
+    MODE=$(/usr/local/bin/get_master_tag.sh scale-in-mode 2>/dev/null || echo "")
+    if [ "$MODE" = "fixed" ]; then
+        sleep 60
+        continue
+    fi
+
     IN_POOL=$(oci compute-management instance-pool list-instances \
         --compartment-id "$COMPARTMENT_ID" \
         --instance-pool-id "$POOL_ID" \
@@ -1015,13 +1081,31 @@ EOF
   invoke_terminate_script = <<-PYEOF
 #!/root/.local/share/pipx/venvs/oci-cli/bin/python
 """Invoke the scale-in function with a {"terminate_instance_id": "<ocid>"}
-body. Uses Instance Principal auth (works on any compartment member node)."""
+body. Uses Instance Principal auth (works on any compartment member node).
+
+The function OCID is resolved at runtime from the master node's scale-in-fn-id
+freeform tag (via get_master_tag.sh). Embedding the OCID would force
+oci_core_instance_configuration replacement on every fixedNumberOfMediaNodes
+toggle, which OCI rejects with 409 while the pool still references it."""
 import json
+import subprocess
 import sys
 
 import oci
 
-FN_ID = "${oci_functions_function.scale_in_fn.id}"
+
+def get_fn_id() -> str:
+    try:
+        result = subprocess.run(
+            ["/usr/local/bin/get_master_tag.sh", "scale-in-fn-id"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return result.stdout.strip()
+    except Exception as exc:
+        print(f"[invoke_terminate] failed to resolve fn id: {exc}", file=sys.stderr)
+        return ""
 
 
 def main() -> int:
@@ -1030,9 +1114,14 @@ def main() -> int:
         return 2
     instance_ocid = sys.argv[1]
 
+    fn_id = get_fn_id()
+    if not fn_id:
+        print("[invoke_terminate] No scale-in function configured (fixed mode or master unreachable).", file=sys.stderr)
+        return 1
+
     signer = oci.auth.signers.InstancePrincipalsSecurityTokenSigner()
     mgmt = oci.functions.FunctionsManagementClient(config={}, signer=signer)
-    fn = mgmt.get_function(function_id=FN_ID).data
+    fn = mgmt.get_function(function_id=fn_id).data
     invoke = oci.functions.FunctionsInvokeClient(
         config={}, signer=signer, service_endpoint=fn.invoke_endpoint
     )
@@ -1040,7 +1129,7 @@ def main() -> int:
     body = json.dumps({"terminate_instance_id": instance_ocid}).encode()
     print(f"[invoke_terminate] body={body!r}", file=sys.stderr)
 
-    result = invoke.invoke_function(function_id=FN_ID, invoke_function_body=body)
+    result = invoke.invoke_function(function_id=fn_id, invoke_function_body=body)
 
     # result.data is a urllib3 response stream
     try:
@@ -1101,7 +1190,17 @@ if command -v docker &>/dev/null; then
     done
 fi
 
-echo "[graceful-shutdown] All containers stopped. Self-terminating..."
+echo "[graceful-shutdown] All containers stopped."
+
+# In fixed-mode deployments there is no scale-in function — drain is complete,
+# let OCI/ACPI proceed with the termination. If we can't determine the mode
+# (master unreachable, API transient), default to elastic behaviour: the
+# function call will retry and self-correct once the master is reachable.
+MODE=$(/usr/local/bin/get_master_tag.sh scale-in-mode 2>/dev/null || echo "")
+if [ "$MODE" = "fixed" ]; then
+    echo "[graceful-shutdown] Fixed mode — drain complete, exiting."
+    exit 0
+fi
 
 # Step 3: Request termination via OCI Function (Resource Principal).
 # Direct instance_principal terminate is blocked by a tenancy-level deny policy;
@@ -1109,7 +1208,7 @@ echo "[graceful-shutdown] All containers stopped. Self-terminating..."
 # same restriction and can call TerminateInstance on our behalf.
 INSTANCE_OCID=$(curl -sf -H "Authorization: Bearer Oracle" \
     "http://169.254.169.254/opc/v2/instance/" | jq -r '.id')
-echo "[graceful-shutdown] Instance OCID: $INSTANCE_OCID"
+echo "[graceful-shutdown] Instance OCID: $INSTANCE_OCID. Self-terminating via function..."
 
 attempt=0
 while true; do
@@ -1260,8 +1359,6 @@ REDIS_PASSWORD="$(/usr/local/bin/store_secret.sh generate REDIS_PASSWORD)"
 MONGO_ADMIN_USERNAME="$(/usr/local/bin/store_secret.sh save MONGO_ADMIN_USERNAME "mongoadmin")"
 MONGO_ADMIN_PASSWORD="$(/usr/local/bin/store_secret.sh generate MONGO_ADMIN_PASSWORD)"
 MONGO_REPLICA_SET_KEY="$(/usr/local/bin/store_secret.sh generate MONGO_REPLICA_SET_KEY)"
-MINIO_ACCESS_KEY="$(/usr/local/bin/store_secret.sh save MINIO_ACCESS_KEY "minioadmin")"
-MINIO_SECRET_KEY="$(/usr/local/bin/store_secret.sh generate MINIO_SECRET_KEY)"
 DASHBOARD_ADMIN_USERNAME="$(/usr/local/bin/store_secret.sh save DASHBOARD_ADMIN_USERNAME "dashboardadmin")"
 DASHBOARD_ADMIN_PASSWORD="$(/usr/local/bin/store_secret.sh generate DASHBOARD_ADMIN_PASSWORD)"
 GRAFANA_ADMIN_USERNAME="$(/usr/local/bin/store_secret.sh save GRAFANA_ADMIN_USERNAME "grafanaadmin")"
@@ -1294,8 +1391,6 @@ COMMON_ARGS=(
   "--mongo-admin-user=$MONGO_ADMIN_USERNAME"
   "--mongo-admin-password=$MONGO_ADMIN_PASSWORD"
   "--mongo-replica-set-key=$MONGO_REPLICA_SET_KEY"
-  "--minio-access-key=$MINIO_ACCESS_KEY"
-  "--minio-secret-key=$MINIO_SECRET_KEY"
   "--dashboard-admin-user=$DASHBOARD_ADMIN_USERNAME"
   "--dashboard-admin-password=$DASHBOARD_ADMIN_PASSWORD"
   "--grafana-admin-user=$GRAFANA_ADMIN_USERNAME"
@@ -1354,13 +1449,11 @@ OPENVIDU_URL="https://$${DOMAIN}/"
 LIVEKIT_URL="wss://$${DOMAIN}/"
 DASHBOARD_URL="https://$${DOMAIN}/dashboard/"
 GRAFANA_URL="https://$${DOMAIN}/grafana/"
-MINIO_URL="https://$${DOMAIN}/minio-console/"
 
 /usr/local/bin/store_secret.sh save OPENVIDU_URL "$OPENVIDU_URL"
 /usr/local/bin/store_secret.sh save LIVEKIT_URL "$LIVEKIT_URL"
 /usr/local/bin/store_secret.sh save DASHBOARD_URL "$DASHBOARD_URL"
 /usr/local/bin/store_secret.sh save GRAFANA_URL "$GRAFANA_URL"
-/usr/local/bin/store_secret.sh save MINIO_URL "$MINIO_URL"
 EOF
 
   update_config_from_secret_script = <<-EOF
@@ -1394,8 +1487,6 @@ export MONGO_ADMIN_PASSWORD=$(get_from_vault MONGO_ADMIN_PASSWORD)
 export MONGO_REPLICA_SET_KEY=$(get_from_vault MONGO_REPLICA_SET_KEY)
 export DASHBOARD_ADMIN_USERNAME=$(get_from_vault DASHBOARD_ADMIN_USERNAME)
 export DASHBOARD_ADMIN_PASSWORD=$(get_from_vault DASHBOARD_ADMIN_PASSWORD)
-export MINIO_ACCESS_KEY=$(get_from_vault MINIO_ACCESS_KEY)
-export MINIO_SECRET_KEY=$(get_from_vault MINIO_SECRET_KEY)
 export GRAFANA_ADMIN_USERNAME=$(get_from_vault GRAFANA_ADMIN_USERNAME)
 export GRAFANA_ADMIN_PASSWORD=$(get_from_vault GRAFANA_ADMIN_PASSWORD)
 export LIVEKIT_API_KEY=$(get_from_vault LIVEKIT_API_KEY)
@@ -1415,8 +1506,6 @@ sed -i "s/MONGO_ADMIN_PASSWORD=.*/MONGO_ADMIN_PASSWORD=$MONGO_ADMIN_PASSWORD/" "
 sed -i "s/MONGO_REPLICA_SET_KEY=.*/MONGO_REPLICA_SET_KEY=$MONGO_REPLICA_SET_KEY/" "$${CLUSTER_CONFIG_DIR}/openvidu.env"
 sed -i "s/DASHBOARD_ADMIN_USERNAME=.*/DASHBOARD_ADMIN_USERNAME=$DASHBOARD_ADMIN_USERNAME/" "$${CLUSTER_CONFIG_DIR}/openvidu.env"
 sed -i "s/DASHBOARD_ADMIN_PASSWORD=.*/DASHBOARD_ADMIN_PASSWORD=$DASHBOARD_ADMIN_PASSWORD/" "$${CLUSTER_CONFIG_DIR}/openvidu.env"
-sed -i "s/MINIO_ACCESS_KEY=.*/MINIO_ACCESS_KEY=$MINIO_ACCESS_KEY/" "$${CLUSTER_CONFIG_DIR}/openvidu.env"
-sed -i "s/MINIO_SECRET_KEY=.*/MINIO_SECRET_KEY=$MINIO_SECRET_KEY/" "$${CLUSTER_CONFIG_DIR}/openvidu.env"
 sed -i "s/GRAFANA_ADMIN_USERNAME=.*/GRAFANA_ADMIN_USERNAME=$GRAFANA_ADMIN_USERNAME/" "$${CLUSTER_CONFIG_DIR}/openvidu.env"
 sed -i "s/GRAFANA_ADMIN_PASSWORD=.*/GRAFANA_ADMIN_PASSWORD=$GRAFANA_ADMIN_PASSWORD/" "$${CLUSTER_CONFIG_DIR}/openvidu.env"
 sed -i "s/LIVEKIT_API_KEY=.*/LIVEKIT_API_KEY=$LIVEKIT_API_KEY/" "$${CLUSTER_CONFIG_DIR}/openvidu.env"
@@ -1433,13 +1522,11 @@ OPENVIDU_URL="https://$${DOMAIN}/"
 LIVEKIT_URL="wss://$${DOMAIN}/"
 DASHBOARD_URL="https://$${DOMAIN}/dashboard/"
 GRAFANA_URL="https://$${DOMAIN}/grafana/"
-MINIO_URL="https://$${DOMAIN}/minio-console/"
 store_in_vault DOMAIN_NAME "$DOMAIN"
 store_in_vault OPENVIDU_URL "$OPENVIDU_URL"
 store_in_vault LIVEKIT_URL "$LIVEKIT_URL"
 store_in_vault DASHBOARD_URL "$DASHBOARD_URL"
 store_in_vault GRAFANA_URL "$GRAFANA_URL"
-store_in_vault MINIO_URL "$MINIO_URL"
 EOF
 
   update_secret_from_config_script = <<-EOF
@@ -1481,8 +1568,6 @@ OPENVIDU_PRO_LICENSE="$(/usr/local/bin/get_value_from_config.sh OPENVIDU_PRO_LIC
 MONGO_ADMIN_USERNAME="$(/usr/local/bin/get_value_from_config.sh MONGO_ADMIN_USERNAME "$${CLUSTER_CONFIG_DIR}/openvidu.env")"
 MONGO_ADMIN_PASSWORD="$(/usr/local/bin/get_value_from_config.sh MONGO_ADMIN_PASSWORD "$${CLUSTER_CONFIG_DIR}/openvidu.env")"
 MONGO_REPLICA_SET_KEY="$(/usr/local/bin/get_value_from_config.sh MONGO_REPLICA_SET_KEY "$${CLUSTER_CONFIG_DIR}/openvidu.env")"
-MINIO_ACCESS_KEY="$(/usr/local/bin/get_value_from_config.sh MINIO_ACCESS_KEY "$${CLUSTER_CONFIG_DIR}/openvidu.env")"
-MINIO_SECRET_KEY="$(/usr/local/bin/get_value_from_config.sh MINIO_SECRET_KEY "$${CLUSTER_CONFIG_DIR}/openvidu.env")"
 DASHBOARD_ADMIN_USERNAME="$(/usr/local/bin/get_value_from_config.sh DASHBOARD_ADMIN_USERNAME "$${CLUSTER_CONFIG_DIR}/openvidu.env")"
 DASHBOARD_ADMIN_PASSWORD="$(/usr/local/bin/get_value_from_config.sh DASHBOARD_ADMIN_PASSWORD "$${CLUSTER_CONFIG_DIR}/openvidu.env")"
 GRAFANA_ADMIN_USERNAME="$(/usr/local/bin/get_value_from_config.sh GRAFANA_ADMIN_USERNAME "$${CLUSTER_CONFIG_DIR}/openvidu.env")"
@@ -1503,8 +1588,6 @@ maybe_save OPENVIDU_PRO_LICENSE "$OPENVIDU_PRO_LICENSE"
 maybe_save MONGO_ADMIN_USERNAME "$MONGO_ADMIN_USERNAME"
 maybe_save MONGO_ADMIN_PASSWORD "$MONGO_ADMIN_PASSWORD"
 maybe_save MONGO_REPLICA_SET_KEY "$MONGO_REPLICA_SET_KEY"
-maybe_save MINIO_ACCESS_KEY "$MINIO_ACCESS_KEY"
-maybe_save MINIO_SECRET_KEY "$MINIO_SECRET_KEY"
 maybe_save DASHBOARD_ADMIN_USERNAME "$DASHBOARD_ADMIN_USERNAME"
 maybe_save DASHBOARD_ADMIN_PASSWORD "$DASHBOARD_ADMIN_PASSWORD"
 maybe_save GRAFANA_ADMIN_USERNAME "$GRAFANA_ADMIN_USERNAME"
@@ -1707,13 +1790,25 @@ CONFIG_S3_EOF
   # Update shared secrets
   /usr/local/bin/after_install.sh || { echo "[OpenVidu] error updating shared secrets"; exit 1; }
 
-  # Create scale-in function invoker script
+  # Scale-in function invoker. Always installed; behavior is driven at runtime
+  # by this instance's freeform tags (set by Terraform). When the user toggles
+  # fixedNumberOfMediaNodes, only the tags change — user_data is immutable in
+  # OCI, so embedding the function OCID here would force master recreation.
   cat > /usr/local/bin/invoke_scalein.sh << 'INVOKE_EOF'
 #!/bin/bash
 export HOME="/root"
 export PATH="$PATH:/root/.local/bin"
+
+META=$(curl -sf -H "Authorization: Bearer Oracle" http://169.254.169.254/opc/v2/instance/) || exit 0
+MODE=$(echo "$META" | jq -r '.freeformTags["scale-in-mode"] // empty')
+FN_ID=$(echo "$META" | jq -r '.freeformTags["scale-in-fn-id"] // empty')
+
+# Fixed-mode deployments have no scale-in function — exit quietly.
+[ "$MODE" = "fixed" ] && exit 0
+[ -z "$FN_ID" ] && exit 0
+
 oci fn function invoke \
-  --function-id ${oci_functions_function.scale_in_fn.id} \
+  --function-id "$FN_ID" \
   --fn-invoke-type sync \
   --file /dev/stdout \
   --body '' \
@@ -1755,7 +1850,8 @@ oci bv boot-volume list \
 CLEANUP_EOF
   chmod +x /usr/local/bin/cleanup_boot_volumes.sh
 
-  # Schedule restart on reboot, scale-in every 5 min, boot volume cleanup every 5 min
+  # Schedule restart on reboot, scale-in every 5 min (no-op in fixed mode,
+  # gated by tags inside the script), boot volume cleanup every 5 min.
   { \
     echo "@reboot /usr/local/bin/restart.sh >> /var/log/openvidu-restart.log 2>&1"; \
     echo "*/5 * * * * /usr/local/bin/invoke_scalein.sh >> /dev/null 2>&1"; \
@@ -1945,11 +2041,13 @@ OCI_CLI_VERSION="3.83.0"
 pipx install oci-cli==$${OCI_CLI_VERSION}
 export PATH="$PATH:$HOME/.local/bin"
 
-# Write pre-drain config (Terraform bakes in actual values at deploy time)
+# Write pre-drain config (Terraform bakes in actual values at deploy time).
+# STACK_NAME is used by get_master_tag.sh to find the master node by freeform tag.
 mkdir -p /etc/openvidu
 cat > /etc/openvidu/predrain.conf << 'CONF_EOF'
 COMPARTMENT_ID=${var.compartment_ocid}
 POOL_DISPLAY_NAME=${var.stackName}-media-pool
+STACK_NAME=${var.stackName}
 CONF_EOF
 
 # install.sh
@@ -1958,6 +2056,14 @@ ${local.install_script_media}
 INSTALL_EOF
 chmod +x /usr/local/bin/install.sh
 
+# get_master_tag.sh — runtime resolver for the master's scale-in-* freeform
+# tags. Used by the pre-drain daemon, graceful_shutdown.sh, and invoke_terminate.py
+# to decide whether scale-in is active without baking values into user_data.
+cat > /usr/local/bin/get_master_tag.sh << 'GET_MASTER_TAG_EOF'
+${local.get_master_tag_script}
+GET_MASTER_TAG_EOF
+chmod +x /usr/local/bin/get_master_tag.sh
+
 # ------------------------- Graceful Drain Setup (two-layer approach) -------------------------
 # Layer 1 — Pre-drain daemon (primary): monitors pool size and local CPU. When scale-in
 #   conditions are met and this is the oldest node, it detaches itself from the pool
@@ -1965,6 +2071,12 @@ chmod +x /usr/local/bin/install.sh
 #   OCI's 15-min ACPI timeout never applies — the instance is outside the pool when draining.
 # Layer 2 — Systemd shutdown service (fallback): catches the rare case where an ACPI
 #   shutdown arrives before the daemon completes; blocks OS poweroff until drain finishes.
+#
+# Both layers are ALWAYS installed regardless of fixedNumberOfMediaNodes. They self-gate
+# at runtime via the master's scale-in-mode freeform tag (read through get_master_tag.sh):
+# in fixed mode the pre-drain daemon idles and graceful_shutdown skips the function
+# invocation. Baking the toggle into user_data would force instance_configuration
+# replacement on every change, which OCI rejects (409) while the pool is attached.
 
 # Layer 1: pre-drain daemon
 cat > /usr/local/bin/openvidu-pre-drain.sh << 'PREDRAIN_EOF'
@@ -2039,7 +2151,8 @@ systemctl start openvidu || { echo "[OpenVidu] error starting OpenVidu"; exit 1;
 # Mark installation as complete
 echo "installation_complete" > /usr/local/bin/openvidu_install_counter.txt
 
-# Start pre-drain daemon after OpenVidu is installed
+# Start pre-drain daemon after OpenVidu is installed (no-op in fixed mode, gated
+# at runtime by the master's scale-in-mode tag).
 systemctl start openvidu-pre-drain.service
 
 EOF

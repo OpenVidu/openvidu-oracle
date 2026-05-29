@@ -22,15 +22,16 @@ stackName = "openvidu-elastic"
 # Get yours at: https://openvidu.io/account
 openviduLicense = "your-openvidu-pro-license-key"
 
-# OCIR image of the scale-in OCI Function published by OpenVidu.
-# Format: <region-key>.ocir.io/<namespace>/<repo>:<tag>
-# Example: mad.ocir.io/openvidu/openvidu-scalein:main
-scale_in_function_image = "mad.ocir.io/openvidu/openvidu-scalein:main"
-
 # =================================================================
 #  OPTIONAL CONFIGURATION
 #  Uncomment (remove the #) only if you need to change the default value.
 # =================================================================
+
+# OCIR image of the scale-in OCI Function. Defaults to the image
+# published by OpenVidu in the Madrid registry. Override only if you
+# are mirroring it to your own registry — follow the docs to keep it
+# in sync. Format: <region-key>.ocir.io/<namespace>/<repo>:<tag>.
+# scale_in_function_image = "mad.ocir.io/axp2ice0s7el/openvidu-scalein:main"
 
 # --- Region and Availability Domain ---
 
@@ -82,7 +83,15 @@ scale_in_function_image = "mad.ocir.io/openvidu/openvidu-scalein:main"
 # mediaNodeDiskSize = 100
 
 
-# --- Autoscaling ---
+# --- Media node sizing mode ---
+
+# Fixed number of media nodes (disables autoscaling and the scale-in function).
+# Set to > 0 to deploy exactly N media nodes with no elastic behavior. Leave at
+# 0 (default) to use the autoscaling configuration below.
+# fixedNumberOfMediaNodes = 0
+
+
+# --- Autoscaling (ignored when fixedNumberOfMediaNodes > 0) ---
 
 # Number of media nodes to deploy initially. Default: 1.
 # Leave commented to use the default.
@@ -116,10 +125,6 @@ scale_in_function_image = "mad.ocir.io/openvidu/openvidu-scalein:main"
 # Required if using 'owncert'. Recommended for 'letsencrypt'.
 # Leave empty or commented to use an automatic sslip.io domain.
 # domainName = "video.mycompany.com"
-
-# Previously created OCI Reserved Public IP address to assign to the Master Node.
-# Leave empty or commented to create a new public IP automatically.
-# publicIpAddress = "1.2.3.4"
 
 # Only if using 'owncert': public certificate and private key contents in base64.
 # ownPublicCertificate  = "base64_of_your_public_certificate.pem"

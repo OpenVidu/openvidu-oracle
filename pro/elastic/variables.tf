@@ -42,16 +42,6 @@ variable "certificateType" {
   }
 }
 
-variable "publicIpAddress" {
-  description = "Previously created Reserved Public IP address for the OpenVidu Master Node. Blank will generate a new public IP."
-  type        = string
-  default     = ""
-  validation {
-    condition     = can(regex("^$|^([01]?\\d{1,2}|2[0-4]\\d|25[0-5])\\.([01]?\\d{1,2}|2[0-4]\\d|25[0-5])\\.([01]?\\d{1,2}|2[0-4]\\d|25[0-5])\\.([01]?\\d{1,2}|2[0-4]\\d|25[0-5])$", var.publicIpAddress))
-    error_message = "The Public IP does not have a valid IPv4 format"
-  }
-}
-
 variable "domainName" {
   description = "Domain name for the OpenVidu Deployment."
   type        = string
@@ -145,27 +135,37 @@ variable "mediaNodeMemory" {
 }
 
 variable "initialNumberOfMediaNodes" {
-  description = "Number of initial media nodes to deploy."
+  description = "Number of initial media nodes to deploy. Ignored when fixedNumberOfMediaNodes > 0."
   type        = number
   default     = 1
 }
 
 variable "minNumberOfMediaNodes" {
-  description = "Minimum number of media nodes for autoscaling."
+  description = "Minimum number of media nodes for autoscaling. Ignored when fixedNumberOfMediaNodes > 0."
   type        = number
   default     = 1
 }
 
 variable "maxNumberOfMediaNodes" {
-  description = "Maximum number of media nodes for autoscaling."
+  description = "Maximum number of media nodes for autoscaling. Ignored when fixedNumberOfMediaNodes > 0."
   type        = number
   default     = 5
 }
 
 variable "scaleTargetCPU" {
-  description = "Target CPU percentage to trigger scale-out."
+  description = "Target CPU percentage to trigger scale-out. Ignored when fixedNumberOfMediaNodes > 0."
   type        = number
   default     = 50
+}
+
+variable "fixedNumberOfMediaNodes" {
+  description = "If > 0, deploys a fixed number of media nodes with no autoscaling and no scale-in function (initial/min/max/scaleTargetCPU and scale_in_function_image are ignored). If 0 (default), the deployment is elastic and autoscaling is enabled."
+  type        = number
+  default     = 0
+  validation {
+    condition     = var.fixedNumberOfMediaNodes >= 0
+    error_message = "fixedNumberOfMediaNodes must be >= 0."
+  }
 }
 
 variable "bucketName" {
@@ -218,8 +218,9 @@ variable "user_ocid" {
 }
 
 variable "scale_in_function_image" {
-  description = "OCIR image URL of the scale-in OCI Function published by OpenVidu. Example: mad.ocir.io/openvidu/<version>/openvidu-scalein:latest"
+  description = "OCIR image URL of the scale-in OCI Function published by OpenVidu. Override only if you are mirroring the image to your own registry; in that case follow the docs to keep it in sync. Ignored when fixedNumberOfMediaNodes > 0."
   type        = string
+  default     = "mad.ocir.io/axp2ice0s7el/openvidu-scalein:main"
 }
 
 
