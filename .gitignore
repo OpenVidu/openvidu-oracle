@@ -6,3 +6,7 @@
 *.tfvars
 *.sh
 .dockerignore
+
+# Python
+__pycache__/
+*.py[cod]
