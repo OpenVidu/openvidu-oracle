@@ -8,13 +8,11 @@ ENV PIP_NO_CACHE_DIR=1 \
 ADD requirements.txt /function/
 RUN pip3 install --target /python/packages -r requirements.txt
 
-# The OCI Python SDK ships clients for ~175 services and weighs ~470 MB.
-# func.py only calls oci.core and oci.monitoring directly, but importing
-# them drags in transitive subpackages via oci/__init__.py and
-# oci/pagination (which references oci.dns and oci.object_storage). The
-# minimal set was discovered empirically by importing in the full image
-# and inspecting sys.modules. Every other service package is dead weight.
-# Saves ~430 MB.
+# The OCI Python SDK ships ~175 service clients (~470 MB). func.py uses only
+# oci.core and oci.monitoring, but importing them drags in transitive
+# subpackages via oci/__init__.py and oci/pagination (which reference oci.dns
+# and oci.object_storage). The keep-list below was found empirically (import
+# in the full image, inspect sys.modules); the rest is dead weight. Saves ~430 MB.
 RUN set -eux; \
     cd /python/packages/oci; \
     for d in */; do \

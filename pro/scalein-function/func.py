@@ -1,17 +1,14 @@
 """OpenVidu scale-in OCI Function.
 
-Two execution modes, picked from the request body:
+Two modes, chosen from the request body:
 
-* **Terminate** — Called by a media node after its graceful drain finishes.
-  The node POSTs a JSON body with key `terminate_instance_id` and the function
-  uses Resource Principal auth to call TerminateInstance (which the node
-  itself cannot do, because instance_principal is denied that operation at
-  tenancy level).
+* **Terminate** — A draining media node POSTs `terminate_instance_id`; the
+  function calls TerminateInstance via Resource Principal auth (the node can't:
+  instance_principal is denied that op at tenancy level).
 
 * **Scale-in eval** — Called every 5 min by the master's cron with an empty
-  body. The function checks pool-wide CPU and, if it's below threshold and
-  the pool is above MIN_NODES, detaches the oldest member to start the
-  drain/self-terminate sequence.
+  body. If pool-wide CPU is below threshold and the pool is above MIN_NODES,
+  detaches the oldest member to start drain/self-terminate.
 
 Environment variables (set on the Function Application by Terraform):
     COMPARTMENT_ID    — OCI compartment OCID
@@ -32,9 +29,9 @@ from fdk import response
 
 logger = logging.getLogger()
 
-# How long a freshly spawned node is exempt from scale-in checks. Without this,
-# the new node's cold CPU pulls the pool average below threshold and triggers
-# an immediate scale-in of someone else.
+# Grace window exempting a freshly spawned node from scale-in checks. Without
+# it, the new node's cold CPU drags the pool average below threshold and
+# triggers an immediate scale-in of someone else.
 GRACE_MINUTES = 7
 
 
@@ -50,9 +47,9 @@ def handler(ctx, data: io.BytesIO = None):
 def _parse_body(data) -> dict:
     """Read the request body (whatever shape FDK hands us) and parse as JSON.
 
-    FDK has historically passed `data` as either `io.BytesIO` or raw bytes
-    depending on version; handle both. Body-routing bugs here previously
-    sent the wrong branch the call, so we log liberally.
+    FDK passes `data` as either io.BytesIO or raw bytes depending on version;
+    handle both. Body-routing bugs here previously took the wrong branch, so
+    we log liberally.
     """
     logger.info("handler invoked: data type=%s, repr=%r", type(data).__name__, data)
     if data is None:
@@ -78,18 +75,15 @@ def _parse_body(data) -> dict:
 def _handle_terminate(ctx, signer, instance_id: str):
     """Terminate an instance on behalf of a draining media node.
 
-    Identity model — a node may ONLY ask to terminate itself.
-    OCI Functions injects the authenticated caller's identity into the
-    request headers AFTER signature validation:
-        oci-subject-type  = "instance" | "user" | "service" | ...
-        oci-subject-id    = OCID of the calling principal
-    For Instance Principal callers these are the instance's own OCID. They
-    cannot be spoofed by the caller — the OCI service overwrites them.
-    We refuse anything that doesn't match the body's terminate_instance_id.
+    Identity model — a node may ONLY terminate itself. After signature
+    validation OCI Functions injects the caller's identity into the headers
+    (oci-subject-type, oci-subject-id); for Instance Principal callers these
+    are the instance's own OCID and cannot be spoofed (the service overwrites
+    them). We refuse anything not matching the body's terminate_instance_id.
 
-    Resource Principal auth on the actual TerminateInstance call (the
-    function's own identity) is still needed to bypass the tenancy-level
-    deny policy that blocks instance_principal from terminating compute.
+    Resource Principal auth on the actual TerminateInstance call is still
+    needed to bypass the tenancy-level deny policy that blocks
+    instance_principal from terminating compute.
     """
     headers     = {k.lower(): v for k, v in (ctx.Headers() or {}).items()}
     caller_id   = headers.get("oci-subject-id", "")
@@ -178,8 +172,8 @@ def _evaluate_scale_in(ctx, signer):
         logger.info("No Running instances found in pool.")
         return _noop(ctx, "no_running_members")
 
-    # Skip the cycle if ANY member is still in its grace period — a young
-    # node biases the pool average downward and would cause a false scale-in.
+    # Skip the cycle if ANY member is still in its grace period — a young node
+    # biases the pool average down and would cause a false scale-in.
     for member in running:
         age_minutes = (now_utc - member.time_created).total_seconds() / 60
         if age_minutes < GRACE_MINUTES:
@@ -213,8 +207,8 @@ def _evaluate_scale_in(ctx, signer):
         logger.info("Pool avg CPU at or above threshold. No scale-in.")
         return _noop(ctx, "cpu_above_threshold")
 
-    # Detach the oldest Running node — pool target -1, no replacement spawned,
-    # no OCI-forced terminate. The node's drain watcher reacts to the removal.
+    # Detach the oldest Running node — pool target -1, no replacement, no
+    # OCI-forced terminate. The node's drain watcher reacts to the removal.
     target = running[0]
     logger.info(
         "Pool avg %.1f%% < %.1f%%. Detaching oldest node: %s (%s).",

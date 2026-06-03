@@ -84,10 +84,9 @@ resource "oci_core_security_list" "openvidu_subnet_security_list" {
     protocol    = "all"
   }
 
-  # Allow all ingress from within the VCN — NSGs handle fine-grained control.
-  # OCI evaluates security lists AND NSGs with AND logic, so without this
-  # ingress rule the security list would block all intra-VCN traffic even
-  # when the NSG has a matching allow rule.
+  # Allow all intra-VCN ingress; NSGs do fine-grained control. OCI ANDs
+  # security lists with NSGs, so without this rule all intra-VCN traffic is
+  # blocked even when an NSG allows it.
   ingress_security_rules {
     source   = "10.0.0.0/16"
     protocol = "all"
@@ -254,8 +253,8 @@ resource "oci_core_subnet" "openvidu_subnet" {
 
 # ------------------------- Object Storage -------------------------
 
-# Customer Secret Key for S3-compatible access
-# The 'id' attribute is the S3 Access Key ID; 'key' is the S3 Secret Key (sensitive, stored in Terraform state)
+# Customer Secret Key for S3-compatible access.
+# 'id' = S3 Access Key ID; 'key' = S3 Secret Key (sensitive, in TF state).
 resource "oci_identity_customer_secret_key" "openvidu_s3_key" {
   display_name = "${var.stackName}-s3-key"
   user_id      = var.user_ocid
@@ -279,7 +278,40 @@ resource "oci_objectstorage_object" "ssh_private_key" {
   object    = "openvidu_private_ssh_key_${var.stackName}.pem"
   content   = tls_private_key.openvidu_ssh_key_elastic.private_key_pem
 
+  # Depend on null_resource.empty_bucket so this object is destroyed BEFORE the bulk-delete.
+  depends_on = [oci_objectstorage_bucket.appdata_bucket, null_resource.empty_bucket]
+}
+
+# Empty the Terraform-created bucket before destroy — OCI won't delete a
+# non-empty bucket (runtime recordings, etc.). A user-provided bucket
+# (bucketName set) is left untouched. Ordered after the SSH key object's destroy.
+resource "null_resource" "empty_bucket" {
+  triggers = {
+    namespace = data.oci_objectstorage_namespace.ns.namespace
+    region    = var.region
+    bucket    = var.bucketName == "" ? local.bucket_app_data_name : ""
+  }
+
   depends_on = [oci_objectstorage_bucket.appdata_bucket]
+
+  provisioner "local-exec" {
+    when    = destroy
+    command = <<-SCRIPT
+      set -x
+      if ! command -v oci >/dev/null 2>&1; then
+        echo "[empty-bucket] WARN: 'oci' CLI not in PATH ($PATH); a non-empty bucket will block destroy."
+        exit 0
+      fi
+      B="${self.triggers.bucket}"
+      [ -z "$B" ] && exit 0
+      echo "[empty-bucket] Emptying bucket $B ..."
+      oci os object bulk-delete \
+        --namespace "${self.triggers.namespace}" \
+        --bucket-name "$B" \
+        --region "${self.triggers.region}" \
+        --force 2>/dev/null || echo "[empty-bucket] bulk-delete on $B non-zero (already empty?)"
+    SCRIPT
+  }
 }
 
 # ------------------------- Vault / Secrets -------------------------
@@ -295,8 +327,8 @@ data "oci_kms_vault" "openvidu_vault" {
   vault_id = var.vault_ocid != "" ? var.vault_ocid : oci_kms_vault.openvidu_vault[0].id
 }
 
-# OCI marks the vault ACTIVE before its management endpoint DNS is resolvable.
-# Wait until the hostname resolves before creating the key.
+# OCI marks the vault ACTIVE before its management endpoint DNS resolves.
+# Wait for the hostname to resolve before creating the key.
 resource "null_resource" "wait_for_vault_dns" {
   count = var.vault_ocid == "" ? 1 : 0
   triggers = {
@@ -376,10 +408,10 @@ resource "oci_core_instance" "openvidu_master_node" {
   freeform_tags = {
     "stack"     = var.stackName
     "node-type" = "master"
-    # Runtime config consumed by invoke_scalein.sh. Kept as tags (not baked
-    # into user_data) so toggling fixedNumberOfMediaNodes updates the master
-    # in place instead of recreating it (which would mean a fresh domain,
-    # vault secrets, and effectively a new deployment).
+    # Runtime config for invoke_scalein.sh. Kept as tags (not in user_data) so
+    # toggling fixedNumberOfMediaNodes updates the master in place rather than
+    # recreating it (which would mean a fresh domain, vault secrets, and
+    # effectively a new deployment).
     "scale-in-mode"  = var.fixedNumberOfMediaNodes > 0 ? "fixed" : "elastic"
     "scale-in-fn-id" = try(oci_functions_function.scale_in_fn[0].id, "")
   }
@@ -434,33 +466,26 @@ resource "oci_core_instance_configuration" "media_node_config" {
 }
 
 # Cleanup orphaned media nodes on `terraform destroy`.
-#
-# Instances detached from the pool by the scale-in function (is_auto_terminate=false)
-# are no longer tracked by Terraform. If graceful_shutdown.sh fails to self-terminate
-# one of them it would stay alive forever.
-#
-# Destroy order (null_resource depends_on pool):
-#   1. THIS provisioner runs first → terminates detached/orphaned media nodes
-#   2. instance pool destroyed → OCI terminates its current members
-#
-# Identification: every media node is created with freeform tags
-#   stack=<stackName>  node-type=media  (set in media_node_config launch_details).
+# Instances detached from the pool by the scale-in function
+# (is_auto_terminate=false) are no longer tracked by Terraform; if
+# graceful_shutdown.sh fails to self-terminate one, it stays alive forever.
+# This provisioner runs before the pool is destroyed and terminates them.
+# Orphans are identified by freeform tags stack=<stackName> node-type=media.
 resource "null_resource" "cleanup_orphaned_media_nodes" {
   triggers = {
     compartment_id = var.compartment_ocid
     stack_name     = var.stackName
   }
 
-  # depends_on subnet so that on destroy this runs BEFORE the subnet is deleted,
-  # ensuring orphaned instances (outside the pool) are terminated first.
+  # depends_on subnet so on destroy this runs BEFORE the subnet is deleted,
+  # terminating orphaned instances (outside the pool) first.
   depends_on = [oci_core_subnet.openvidu_subnet]
 
   provisioner "local-exec" {
     when = destroy
-    # No `environment` block on purpose: the provisioner inherits the PATH of
-    # the shell that invoked `terraform destroy`, so wherever the user has the
-    # OCI CLI (pipx ~/.local/bin, system /usr/local/bin, brew, etc.) it just
-    # works without us guessing.
+    # No `environment` block on purpose: inherit the invoking shell's PATH so
+    # the OCI CLI is found wherever the user installed it (pipx, system, brew)
+    # without us guessing.
     command = <<-SCRIPT
       set -x
       if ! command -v oci >/dev/null 2>&1; then
@@ -470,10 +495,9 @@ resource "null_resource" "cleanup_orphaned_media_nodes" {
         exit 0
       fi
       echo "[cleanup] Looking for orphaned media nodes (stack=${self.triggers.stack_name})..."
-      # NOTE: single-dollar shell vars are correct here. Terraform only treats
-      # double-dollar followed by an open-brace as an escape. A bare $$VAR
-      # passes through literally and breaks both jq (invalid syntax) and shell
-      # (where $$ alone expands to the PID).
+      # NOTE: single-dollar shell vars are correct here. Terraform only escapes
+      # $${...}; a bare $$VAR passes through literally, breaking jq (invalid
+      # syntax) and shell (where $$ expands to the PID).
 
       # All non-terminated media instances of this stack
       ALL_IDS=$(oci compute instance list \
@@ -489,9 +513,9 @@ resource "null_resource" "cleanup_orphaned_media_nodes" {
                )
              | .id') || { echo "[cleanup] ERROR: failed to list instances"; exit 0; }
 
-      # Pool members (if the pool still exists at this point). The pool's own
-      # destroy will terminate its members — we ONLY want to kill instances
-      # that detached and got stuck (true orphans).
+      # Pool members (if the pool still exists). The pool's own destroy
+      # terminates its members — we ONLY kill instances that detached and got
+      # stuck (true orphans).
       POOL_ID=$(oci compute-management instance-pool list \
         --compartment-id "${self.triggers.compartment_id}" \
         --all --output json 2>/dev/null \
@@ -508,8 +532,8 @@ resource "null_resource" "cleanup_orphaned_media_nodes" {
           | jq -r '.data[].id') || MEMBER_IDS=""
       fi
 
-      # Orphans = ALL_IDS - MEMBER_IDS. Plain POSIX, no bashisms — local-exec
-      # uses /bin/sh which on Ubuntu is dash (no process substitution).
+      # Orphans = ALL_IDS - MEMBER_IDS. Plain POSIX — local-exec uses /bin/sh
+      # which on Ubuntu is dash (no process substitution).
       IDS=""
       for id in $ALL_IDS; do
         case "$MEMBER_IDS" in
@@ -545,10 +569,10 @@ resource "null_resource" "cleanup_orphaned_media_nodes" {
       fi
 
       echo "[cleanup] Looking for orphaned boot volumes (stack=${self.triggers.stack_name})..."
-      # BVs are named after their parent instance (inst-XXXXX-STACK-media-
-      # pool), NOT the pool itself. startswith() never matched these — use
-      # contains(). The AVAILABLE filter guarantees we never touch BVs that
-      # are still attached to a running instance.
+      # BVs are named after their parent instance (inst-XXXXX-STACK-media-pool),
+      # not the pool — startswith() never matched, so use contains(). The
+      # AVAILABLE filter ensures we never touch BVs still attached to a running
+      # instance.
       BVIDS=$(oci bv boot-volume list \
         --compartment-id "${self.triggers.compartment_id}" \
         --all --output json \
@@ -621,10 +645,9 @@ resource "oci_autoscaling_auto_scaling_configuration" "media_node_autoscaling" {
         }
       }
     }
-    # OCI provider ≥8.12.0 requires at least one scale-in rule in the policy.
-    # Threshold LT 0% is mathematically impossible — CPU utilisation is always ≥ 0.
-    # This rule exists ONLY to satisfy the provider; it will NEVER fire.
-    # All scale-in is owned by the OCI Function (func.py), invoked every 5 min.
+    # OCI provider ≥8.12.0 requires at least one scale-in rule. LT 0% can never
+    # be true (CPU is always ≥ 0), so this rule never fires — it only satisfies
+    # the provider. Real scale-in is owned by the OCI Function (func.py).
     rules {
       action {
         type  = "CHANGE_COUNT_BY"
@@ -644,9 +667,9 @@ resource "oci_autoscaling_auto_scaling_configuration" "media_node_autoscaling" {
 
 # ------------------------- IAM: Instance Principal for Pre-drain Daemon -------------------------
 
-# Dynamic Group matching all instances in the compartment.
-# Enables media nodes to authenticate to the OCI API via Instance Principal
-# (no credentials required on the instance) to poll their own lifecycle state.
+# Dynamic Group matching all compartment instances. Lets media nodes
+# authenticate to the OCI API via Instance Principal (no on-instance
+# credentials) to poll their own lifecycle state.
 resource "oci_identity_dynamic_group" "openvidu_instances_dg" {
   compartment_id = var.tenancy_ocid
   name           = "${var.stackName}-instances-dg"
@@ -654,12 +677,12 @@ resource "oci_identity_dynamic_group" "openvidu_instances_dg" {
   matching_rule  = "instance.compartment.id = '${var.compartment_ocid}'"
 }
 
-# Policy: allows instances to poll pool membership (pre-drain daemon), self-terminate
-# after drain (graceful_shutdown.sh), manage vault secrets, and invoke the scale-in
+# Policy: lets instances poll pool membership (pre-drain), self-terminate after
+# drain (graceful_shutdown.sh), manage vault secrets, and invoke the scale-in
 # function (master node).
 resource "oci_identity_policy" "media_node_predrain_policy" {
-  # Must be at tenancy (root) level so that cross-compartment grants work
-  # when the vault lives in a different compartment than the deployment.
+  # Must be at tenancy (root) level so cross-compartment grants work when the
+  # vault lives in a different compartment than the deployment.
   compartment_id = var.tenancy_ocid
   name           = "${var.stackName}-predrain-policy"
   description    = "Allow OpenVidu instances to manage their lifecycle and invoke the scale-in function"
@@ -668,13 +691,13 @@ resource "oci_identity_policy" "media_node_predrain_policy" {
     "allow dynamic-group ${oci_identity_dynamic_group.openvidu_instances_dg.name} to manage instances in compartment id ${var.compartment_ocid}",
     "allow dynamic-group ${oci_identity_dynamic_group.openvidu_instances_dg.name} to {INSTANCE_INSPECT,INSTANCE_READ,INSTANCE_UPDATE,INSTANCE_DELETE} in compartment id ${var.compartment_ocid}",
     "allow dynamic-group ${oci_identity_dynamic_group.openvidu_instances_dg.name} to manage boot-volumes in compartment id ${var.compartment_ocid}",
-    # use vnics + use subnets required for OCI to detach the VNIC when terminating an instance
+    # use vnics + use subnets: required for OCI to detach the VNIC on instance terminate
     "allow dynamic-group ${oci_identity_dynamic_group.openvidu_instances_dg.name} to use vnics in compartment id ${var.compartment_ocid}",
     "allow dynamic-group ${oci_identity_dynamic_group.openvidu_instances_dg.name} to use subnets in compartment id ${var.compartment_ocid}",
     "allow dynamic-group ${oci_identity_dynamic_group.openvidu_instances_dg.name} to manage secret-family in compartment id ${var.compartment_ocid}",
     "allow dynamic-group ${oci_identity_dynamic_group.openvidu_instances_dg.name} to read secret-bundles in compartment id ${var.compartment_ocid}",
     "allow dynamic-group ${oci_identity_dynamic_group.openvidu_instances_dg.name} to read metrics in compartment id ${var.compartment_ocid}",
-    # Vault and key may be in a different compartment — use the vault's actual compartment
+    # Vault and key may live in a different compartment — use the vault's own one
     "allow dynamic-group ${oci_identity_dynamic_group.openvidu_instances_dg.name} to use vaults in compartment id ${data.oci_kms_vault.openvidu_vault.compartment_id}",
     "allow dynamic-group ${oci_identity_dynamic_group.openvidu_instances_dg.name} to use keys in compartment id ${data.oci_kms_vault.openvidu_vault.compartment_id}",
     "allow dynamic-group ${oci_identity_dynamic_group.openvidu_instances_dg.name} to use fn-invocation in compartment id ${var.compartment_ocid}",
@@ -684,9 +707,8 @@ resource "oci_identity_policy" "media_node_predrain_policy" {
 
 # ------------------------- OCI Functions: Scale-in -------------------------
 
-# Dynamic Group: matches the scale-in function for Resource Principal auth.
-# Required so the function can call OCI APIs (instance-pools, monitoring)
-# without embedding credentials in the image.
+# Dynamic Group matching the scale-in function for Resource Principal auth, so
+# it can call OCI APIs (instance-pools, monitoring) without embedded credentials.
 resource "oci_identity_dynamic_group" "scale_in_fn_dg" {
   count = var.fixedNumberOfMediaNodes > 0 ? 0 : 1
 
@@ -696,8 +718,8 @@ resource "oci_identity_dynamic_group" "scale_in_fn_dg" {
   matching_rule  = "ALL {resource.type='fnfunc', resource.compartment.id='${var.compartment_ocid}'}"
 }
 
-# Policy: allows the scale-in function to list/inspect/resize the media node pool
-# and to read CPU metrics from OCI Monitoring (same data source as func.py).
+# Policy: lets the scale-in function list/inspect/resize the media node pool and
+# read CPU metrics from OCI Monitoring (same data source as func.py).
 resource "oci_identity_policy" "scale_in_fn_policy" {
   count = var.fixedNumberOfMediaNodes > 0 ? 0 : 1
 
@@ -707,16 +729,16 @@ resource "oci_identity_policy" "scale_in_fn_policy" {
   statements = [
     "allow dynamic-group ${oci_identity_dynamic_group.scale_in_fn_dg[0].name} to manage instance-pools in compartment id ${var.compartment_ocid}",
     "allow dynamic-group ${oci_identity_dynamic_group.scale_in_fn_dg[0].name} to manage instances in compartment id ${var.compartment_ocid}",
-    # terminate-instance with preserve_boot_volume=false must delete the boot
-    # volume too — without volume-family OCI rejects with "volume ... cannot
-    # be terminated because this user does not have sufficient permissions".
+    # preserve_boot_volume=false also deletes the boot volume — without
+    # volume-family OCI rejects with "volume ... cannot be terminated because
+    # this user does not have sufficient permissions".
     "allow dynamic-group ${oci_identity_dynamic_group.scale_in_fn_dg[0].name} to manage volume-family in compartment id ${var.compartment_ocid}",
     "allow dynamic-group ${oci_identity_dynamic_group.scale_in_fn_dg[0].name} to read metrics in compartment id ${var.compartment_ocid}",
   ]
 }
 
-# OCI IAM policy propagation can take 60-120 s after creation/recreation.
-# Wait before launching the master node so instance_principal auth is ready.
+# OCI IAM policy propagation takes 60-120 s after create/recreate. Wait before
+# launching the master so instance_principal auth is ready.
 resource "time_sleep" "wait_for_iam_propagation" {
   depends_on = [
     oci_identity_dynamic_group.openvidu_instances_dg,
@@ -726,8 +748,8 @@ resource "time_sleep" "wait_for_iam_propagation" {
 }
 
 # Function Application: hosts the scale-in function and injects runtime config.
-# The config vars are updated by Terraform; the function reads them at invocation
-# time via os.environ — no image rebuild needed to change them.
+# Config vars are set by Terraform and read at invocation via os.environ — no
+# image rebuild needed to change them.
 resource "oci_functions_application" "scale_in_app" {
   count = var.fixedNumberOfMediaNodes > 0 ? 0 : 1
 
@@ -743,8 +765,8 @@ resource "oci_functions_application" "scale_in_app" {
   }
 }
 
-# Function: uses the pre-built image published by OpenVidu Team in their OCIR
-# (Option B). No docker build/push during terraform apply.
+# Function: uses the pre-built image published by OpenVidu in their OCIR.
+# No docker build/push during terraform apply.
 resource "oci_functions_function" "scale_in_fn" {
   count = var.fixedNumberOfMediaNodes > 0 ? 0 : 1
 
@@ -764,7 +786,6 @@ resource "oci_logging_log_group" "scale_in_log_group" {
 }
 
 # Log: captures function invocation logs (stdout/stderr from func.py).
-# service=functions, resource=application OCID, category=invoke
 resource "oci_logging_log" "scale_in_fn_log" {
   count = var.fixedNumberOfMediaNodes > 0 ? 0 : 1
 
@@ -791,28 +812,26 @@ resource "oci_logging_log" "scale_in_fn_log" {
 locals {
   domain_name = var.domainName != "" ? var.domainName : "openvidu-${replace(oci_core_instance.openvidu_master_node.public_ip, ".", "-")}.sslip.io"
 
-  # ARM shapes in OCI use "VM.Standard.A" / "BM.Standard.A" prefixes (Ampere).
-  # All others (VM.Standard.E*, VM.Standard3, VM.Standard2, BM.Standard2...) are x86.
+  # ARM (Ampere) shapes use "VM.Standard.A" / "BM.Standard.A" prefixes;
+  # all others (VM.Standard.E*, .Standard3/2, BM.Standard2...) are x86.
   is_arm_instance = startswith(var.masterNodeShape, "VM.Standard.A") || startswith(var.masterNodeShape, "BM.Standard.A")
   yq_arch         = local.is_arm_instance ? "arm64" : "amd64"
   yq_sha256       = local.is_arm_instance ? "10a4a2093090363a00b55ad52e132a082f9652970cb8f1ad35a1ae048b917e6e" : "3fa3c1c32d94520102ea4d853d03c3ab907867d964540e896410ad8a7fc6c8f7"
 
-  # Common OCI Vault helpers, sourced by store_secret / update_config_from_secret /
-  # update_secret_from_config. Keeps a single source of truth for retry, query
-  # sanitization, and read/write logic against the vault.
+  # Common OCI Vault helpers (retry, query sanitization, read/write logic),
+  # sourced by store_secret / update_config_from_secret / update_secret_from_config.
   oci_helpers_script = <<-EOF
 #!/bin/bash
-# Common OCI Vault helpers. Sourced by store_secret.sh, update_config_from_secret.sh,
-# and update_secret_from_config.sh. Callers must set VAULT_ID and COMPARTMENT_ID
-# before sourcing; KEY_ID is required only when creating new secrets via
-# store_in_vault.
+# Common OCI Vault helpers. Sourced by store_secret.sh,
+# update_config_from_secret.sh, update_secret_from_config.sh. Callers set
+# VAULT_ID and COMPARTMENT_ID before sourcing; KEY_ID only needed to create
+# new secrets via store_in_vault.
 #
-# We own retry instead of relying on the OCI CLI default: the default strategy
-# can spin internally for ~10 min on 429/5xx and stack under our own retry,
-# producing 20-30 min hangs during install.
+# We own retry instead of the OCI CLI default: the default can spin ~10 min on
+# 429/5xx and stack under our retry, causing 20-30 min hangs during install.
 
-# Per-attempt wall-clock cap. Vault ops typically finish in <5s; longer means
-# the API or auth layer is wedged — kill and let oci_with_retry decide.
+# Per-attempt wall-clock cap. Vault ops finish in <5s; longer means the API or
+# auth layer is wedged — kill it and let oci_with_retry decide.
 : "$${OCI_CALL_TIMEOUT:=45}"
 
 oci_with_retry() {
@@ -839,9 +858,9 @@ oci_with_retry() {
   done
 }
 
-# OCI CLI --raw-output prints "Query returned empty result, no output to show."
-# to stdout instead of an empty string when JMESPath matches nothing. Filter
-# that so callers can test with [[ -z ]].
+# OCI CLI --raw-output prints "Query returned empty result..." to stdout instead
+# of an empty string when JMESPath matches nothing. Filter it so callers can
+# test with [[ -z ]].
 ocid_from_query() {
   local result
   result=$("$@")
@@ -852,8 +871,8 @@ ocid_from_query() {
   fi
 }
 
-# Read an ACTIVE secret by name. Decoded value goes to stdout; returns non-zero
-# if not found (so callers using `$(get_from_vault X)` see empty + nonzero).
+# Read an ACTIVE secret by name. Decoded value to stdout; returns non-zero if
+# not found (so `$(get_from_vault X)` callers see empty + nonzero).
 get_from_vault() {
   local secret_name="$1"
   local secret_id
@@ -876,9 +895,9 @@ get_from_vault() {
 }
 
 # Store or update a secret in the vault.
-# Fast path: ACTIVE → update. Avoids cancel-secret-deletion on every call so we
+# Fast path: ACTIVE → update. Avoids cancel-secret-deletion on every call to
 # stay below the 30/min vault rate limit. PENDING_DELETION fallback recovers
-# from manual schedule-deletion or external tooling. Create requires KEY_ID.
+# from manual/external schedule-deletion. Create requires KEY_ID.
 store_in_vault() {
   local secret_name="$1"
   local secret_value="$2"
@@ -904,8 +923,8 @@ store_in_vault() {
     return
   fi
 
-  # PENDING_DELETION fallback — cancel and wait for ACTIVE; otherwise update
-  # races against CANCELLING_DELETION and OCI returns 409.
+  # PENDING_DELETION fallback — cancel and wait for ACTIVE, else update races
+  # CANCELLING_DELETION and OCI returns 409.
   secret_id=$(ocid_from_query oci_with_retry oci vault secret list \
     --compartment-id "$COMPARTMENT_ID" \
     --vault-id "$VAULT_ID" \
@@ -951,12 +970,11 @@ store_in_vault() {
 }
 EOF
 
-  # get_master_tag.sh — single source of truth for runtime config that depends on
-  # var.fixedNumberOfMediaNodes. The master node carries scale-in-mode and
-  # scale-in-fn-id as freeform tags (updated in place by Terraform on toggle).
-  # Media nodes query them via OCI API instead of baking values into their
-  # user_data, which would force instance_configuration replacement on every
-  # toggle and conflict 409 because the pool still references it.
+  # get_master_tag.sh — single source of truth for runtime config tied to
+  # var.fixedNumberOfMediaNodes. The master carries scale-in-mode and
+  # scale-in-fn-id as freeform tags (updated in place on toggle). Media nodes
+  # query them via OCI API rather than baking values into user_data, which
+  # would force instance_configuration replacement (409, pool still references it).
   get_master_tag_script = <<-EOF
 #!/bin/bash
 # Read a freeform tag from this stack's master node.
@@ -987,24 +1005,24 @@ oci compute instance list \
   | head -1
 EOF
 
-  # Pre-drain daemon: polls pool membership every 30s. When this instance is
-  # no longer in the pool (detached by func.py on scale-in), calls graceful_shutdown.sh.
+  # Pre-drain daemon: polls pool membership every 30s. When detached by func.py
+  # on scale-in, calls graceful_shutdown.sh.
   pre_drain_daemon_script = <<-EOF
 #!/bin/bash
-# OpenVidu Pre-drain Daemon for OCI
-# Responsibility: detect that this instance has been detached from the pool
-# (by the scale-in OCI Function) and call graceful_shutdown.sh.
-# Scale-in decisions are owned by func.py — this daemon only reacts to them.
+# OpenVidu Pre-drain Daemon for OCI.
+# Detects that this instance was detached from the pool (by the scale-in OCI
+# Function) and calls graceful_shutdown.sh. func.py owns scale-in decisions;
+# this daemon only reacts to them.
 
 source /etc/openvidu/predrain.conf
 
-# OCI CLI is installed via pipx under /root/.local/bin; systemd does not set HOME
+# OCI CLI is under /root/.local/bin (pipx); systemd doesn't set HOME
 export HOME="/root"
 export PATH="$PATH:/root/.local/bin"
 
 log() { echo "[openvidu-predrain $(date -u '+%Y-%m-%dT%H:%M:%SZ')] $*" >&2; }
 
-# If drain lock exists, daemon restarted mid-drain — wait for self-termination to complete
+# Drain lock present = daemon restarted mid-drain — wait for self-termination
 if [ -f "/var/run/openvidu-drain.lock" ]; then
     log "Drain lock exists — drain already in progress. Waiting for self-termination."
     while true; do sleep 60; done
@@ -1033,14 +1051,12 @@ while [ -z "$POOL_ID" ]; do
 done
 log "Pool discovered: $POOL_ID"
 
-# Poll every 30s: am I still a member of the pool?
-# When func.py detaches this instance (is_decrement_size=True), it disappears
-# from the pool member list — that is our drain signal.
+# Poll every 30s: am I still in the pool? When func.py detaches this instance
+# (is_decrement_size=True) it leaves the member list — that is our drain signal.
 #
-# In fixed-mode deployments there is no scale-in function and no detach events,
-# so we skip the membership check. The check is re-evaluated every iteration
-# so toggling between modes via Terraform takes effect without restarting the
-# daemon (worst case: one minute of staleness).
+# Fixed mode has no scale-in function and no detaches, so skip the check. Mode
+# is re-read each iteration so a Terraform toggle takes effect without
+# restarting the daemon (worst case ~1 min stale).
 while true; do
     MODE=$(/usr/local/bin/get_master_tag.sh scale-in-mode 2>/dev/null || echo "")
     if [ "$MODE" = "fixed" ]; then
@@ -1066,25 +1082,22 @@ while true; do
 done
 EOF
 
-  # invoke_terminate.py — Python script that calls the scale-in function
-  # with a terminate_instance_id payload using the OCI SDK directly.
+  # invoke_terminate.py — calls the scale-in function with a
+  # terminate_instance_id payload via the OCI SDK directly.
   #
-  # Why a Python script instead of `oci fn function invoke --body ...`:
-  # OCI CLI 3.83 does NOT reliably ship the --body content to the function
-  # — empirically (verified in scale-in fn logs) the function receives an
-  # empty/unparseable body and falls into the scale-in branch instead of
-  # the terminate branch. The Python SDK lets us pass the body as raw bytes
-  # so there is no shell quoting / CLI parsing layer in between.
+  # Why the SDK, not `oci fn function invoke --body ...`: OCI CLI 3.83 does NOT
+  # reliably ship --body to the function (verified in fn logs: it receives an
+  # empty/unparseable body and takes the scale-in branch instead of terminate).
+  # The SDK passes the body as raw bytes, with no shell/CLI parsing in between.
   #
-  # Runs under the pipx-installed OCI CLI venv's Python, which has the oci
-  # SDK available without any extra install.
+  # Runs under the pipx OCI CLI venv's Python, which already has the oci SDK.
   invoke_terminate_script = <<-PYEOF
 #!/root/.local/share/pipx/venvs/oci-cli/bin/python
 """Invoke the scale-in function with a {"terminate_instance_id": "<ocid>"}
-body. Uses Instance Principal auth (works on any compartment member node).
+body, using Instance Principal auth (works on any compartment member node).
 
-The function OCID is resolved at runtime from the master node's scale-in-fn-id
-freeform tag (via get_master_tag.sh). Embedding the OCID would force
+The function OCID is resolved at runtime from the master's scale-in-fn-id
+freeform tag (via get_master_tag.sh). Embedding it would force
 oci_core_instance_configuration replacement on every fixedNumberOfMediaNodes
 toggle, which OCI rejects with 409 while the pool still references it."""
 import json
@@ -1149,14 +1162,14 @@ if __name__ == "__main__":
 PYEOF
 
   # graceful_shutdown.sh — single drain+terminate script called from two paths:
-  #   1. openvidu-pre-drain.service: pool detach detected → exec graceful_shutdown.sh
-  #   2. graceful_shutdown.service: ACPI shutdown (e.g. manual terminate from console)
-  # A lock file prevents double execution when both paths fire simultaneously.
+  #   1. openvidu-pre-drain.service: pool detach detected
+  #   2. graceful_shutdown.service: ACPI shutdown (e.g. manual console terminate)
+  # A lock file prevents double execution when both fire at once.
   graceful_shutdown_script = <<-EOF
 #!/bin/bash
-# Graceful shutdown for OpenVidu Media Node (OCI)
-# Called by the pre-drain daemon (detected pool detach) and by the systemd
-# fallback service (ACPI shutdown). In both cases: drain + self-terminate.
+# Graceful shutdown for OpenVidu Media Node (OCI). Called by the pre-drain
+# daemon (pool detach) and the systemd fallback service (ACPI shutdown).
+# Both paths: drain + self-terminate.
 
 export HOME="/root"
 export PATH="$PATH:/root/.local/bin"
@@ -1192,10 +1205,9 @@ fi
 
 echo "[graceful-shutdown] All containers stopped."
 
-# In fixed-mode deployments there is no scale-in function — drain is complete,
-# let OCI/ACPI proceed with the termination. If we can't determine the mode
-# (master unreachable, API transient), default to elastic behaviour: the
-# function call will retry and self-correct once the master is reachable.
+# Fixed mode has no scale-in function — drain done, let OCI/ACPI terminate. If
+# the mode is undeterminable (master unreachable, API transient), default to
+# elastic: the function call retries and self-corrects once master is reachable.
 MODE=$(/usr/local/bin/get_master_tag.sh scale-in-mode 2>/dev/null || echo "")
 if [ "$MODE" = "fixed" ]; then
     echo "[graceful-shutdown] Fixed mode — drain complete, exiting."
@@ -1204,8 +1216,8 @@ fi
 
 # Step 3: Request termination via OCI Function (Resource Principal).
 # Direct instance_principal terminate is blocked by a tenancy-level deny policy;
-# the scale-in function uses Resource Principal auth which is not subject to the
-# same restriction and can call TerminateInstance on our behalf.
+# the function's Resource Principal auth isn't subject to it and can call
+# TerminateInstance on our behalf.
 INSTANCE_OCID=$(curl -sf -H "Authorization: Bearer Oracle" \
     "http://169.254.169.254/opc/v2/instance/" | jq -r '.id')
 echo "[graceful-shutdown] Instance OCID: $INSTANCE_OCID. Self-terminating via function..."
@@ -1214,9 +1226,9 @@ attempt=0
 while true; do
     attempt=$((attempt + 1))
     echo "[graceful-shutdown] Terminate via function, attempt $attempt..."
-    # Calls the scale-in function via OCI Python SDK (see invoke_terminate.py
-    # docstring): bypasses `oci fn function invoke --body ...` which does NOT
-    # reliably deliver the JSON body in CLI 3.83.
+    # Uses the OCI Python SDK (see invoke_terminate.py): bypasses
+    # `oci fn function invoke --body ...` which doesn't reliably deliver the
+    # JSON body in CLI 3.83.
     if /usr/local/bin/invoke_terminate.py "$INSTANCE_OCID"; then
         echo "[graceful-shutdown] Terminate request accepted on attempt $attempt. Waiting for OCI to terminate."
         while true; do sleep 60; done
@@ -1318,14 +1330,14 @@ export PATH="$PATH:$HOME/.local/bin"
 # Create counter file for tracking script executions
 echo 1 > /usr/local/bin/openvidu_install_counter.txt
 
-# Mark secrets as not ready before generating them, so media nodes
-# from a previous deployment don't read stale values.
+# Mark secrets not-ready before regenerating so media nodes from a previous
+# deployment don't read stale values.
 /usr/local/bin/store_secret.sh save ALL_SECRETS_GENERATED "false"
 
 # Configure domain using OCI IMDS v2
 get_meta() { curl -sf -H "Authorization: Bearer Oracle" "http://169.254.169.254/opc/v2/instance/$1"; }
-# Resolve the public IP with explicit fallbacks. The jq pipe always exits 0
-# (even on null), so || chaining would never trigger the fallbacks.
+# Resolve public IP with explicit fallbacks. The jq pipe always exits 0 (even
+# on null), so || chaining alone would never trigger the fallbacks.
 EXTERNAL_IP=$(get_meta "vnics/" | jq -r '.[0].publicIp // empty' 2>/dev/null) || true
 [[ -z "$EXTERNAL_IP" ]] && EXTERNAL_IP=$(dig +short myip.opendns.com @resolver1.opendns.com 2>/dev/null) || true
 [[ -z "$EXTERNAL_IP" ]] && EXTERNAL_IP=$(curl -sf https://api4.ipify.org 2>/dev/null) || true
@@ -1400,8 +1412,8 @@ COMMON_ARGS=(
   "--livekit-api-secret=$LIVEKIT_API_SECRET"
 )
 
-# Only pass --meet-initial-api-key when the user provided one. Passing an empty
-# value would explicitly null out the installer default.
+# Only pass --meet-initial-api-key when set; an empty value would null out the
+# installer default.
 if [[ "${var.initialMeetApiKey}" != '' ]]; then
   COMMON_ARGS+=("--meet-initial-api-key=$MEET_INITIAL_API_KEY")
 fi
@@ -1548,9 +1560,8 @@ INSTALL_DIR="/opt/openvidu"
 CLUSTER_CONFIG_DIR="$${INSTALL_DIR}/config/cluster"
 MASTER_NODE_CONFIG_DIR="$${INSTALL_DIR}/config/node"
 
-# Skip writes when the config didn't yield a real value. Without this, an
-# unset / commented-out config key gets persisted to vault as the literal
-# string we'd otherwise have written ("" or "none"), corrupting the secret.
+# Skip writes when the config has no real value, else an unset/commented-out
+# key gets persisted to vault as the literal "" or "none", corrupting the secret.
 maybe_save() {
   local key="$1"
   local value="$2"
@@ -1772,7 +1783,7 @@ CONFIG_S3_EOF
     openssl \
     pipx
 
-  # Install OCI CLI via pipx (correct method for modern Ubuntu)
+  # Install OCI CLI via pipx (correct method on modern Ubuntu)
   export HOME="/root"
   OCI_CLI_VERSION="3.83.0"
   pipx install oci-cli==$${OCI_CLI_VERSION}
@@ -1790,9 +1801,9 @@ CONFIG_S3_EOF
   # Update shared secrets
   /usr/local/bin/after_install.sh || { echo "[OpenVidu] error updating shared secrets"; exit 1; }
 
-  # Scale-in function invoker. Always installed; behavior is driven at runtime
-  # by this instance's freeform tags (set by Terraform). When the user toggles
-  # fixedNumberOfMediaNodes, only the tags change — user_data is immutable in
+  # Scale-in function invoker. Always installed; behavior driven at runtime by
+  # this instance's freeform tags (set by Terraform). Toggling
+  # fixedNumberOfMediaNodes changes only the tags — user_data is immutable in
   # OCI, so embedding the function OCID here would force master recreation.
   cat > /usr/local/bin/invoke_scalein.sh << 'INVOKE_EOF'
 #!/bin/bash
@@ -1850,8 +1861,8 @@ oci bv boot-volume list \
 CLEANUP_EOF
   chmod +x /usr/local/bin/cleanup_boot_volumes.sh
 
-  # Schedule restart on reboot, scale-in every 5 min (no-op in fixed mode,
-  # gated by tags inside the script), boot volume cleanup every 5 min.
+  # Cron: restart on reboot; scale-in every 5 min (no-op in fixed mode, gated by
+  # tags in the script); boot volume cleanup every 5 min.
   { \
     echo "@reboot /usr/local/bin/restart.sh >> /var/log/openvidu-restart.log 2>&1"; \
     echo "*/5 * * * * /usr/local/bin/invoke_scalein.sh >> /dev/null 2>&1"; \
@@ -1933,7 +1944,7 @@ get_meta() { curl -sf -H "Authorization: Bearer Oracle" "http://169.254.169.254/
 MASTER_NODE_PRIVATE_IP=$(get_meta "" | jq -r '.metadata.masterNodePrivateIP // empty')
 PRIVATE_IP=$(get_meta "vnics/" | jq -r '.[0].privateIp' 2>/dev/null || hostname -I | awk '{print $1}')
 
-# Helper: run an OCI CLI command with automatic retry on transient errors
+# Run an OCI CLI command, retrying on transient errors
 oci_with_retry() {
   local max_attempts=5
   local attempt=0
@@ -1968,7 +1979,7 @@ ocid_from_query() {
   fi
 }
 
-# Helper: read a secret from OCI Vault via Instance Principal
+# Read a secret from OCI Vault via Instance Principal
 get_secret() {
   local secret_name="$1"
   local secret_id
@@ -2035,14 +2046,14 @@ apt-get update && apt-get install -y \
   openssl \
   pipx
 
-# Install OCI CLI via pipx — required by install script and pre-drain daemon
+# Install OCI CLI via pipx — needed by install script and pre-drain daemon
 export HOME="/root"
 OCI_CLI_VERSION="3.83.0"
 pipx install oci-cli==$${OCI_CLI_VERSION}
 export PATH="$PATH:$HOME/.local/bin"
 
-# Write pre-drain config (Terraform bakes in actual values at deploy time).
-# STACK_NAME is used by get_master_tag.sh to find the master node by freeform tag.
+# Write pre-drain config (Terraform bakes values in at deploy time).
+# STACK_NAME lets get_master_tag.sh find the master by freeform tag.
 mkdir -p /etc/openvidu
 cat > /etc/openvidu/predrain.conf << 'CONF_EOF'
 COMPARTMENT_ID=${var.compartment_ocid}
@@ -2057,26 +2068,26 @@ INSTALL_EOF
 chmod +x /usr/local/bin/install.sh
 
 # get_master_tag.sh — runtime resolver for the master's scale-in-* freeform
-# tags. Used by the pre-drain daemon, graceful_shutdown.sh, and invoke_terminate.py
-# to decide whether scale-in is active without baking values into user_data.
+# tags. Used by the pre-drain daemon, graceful_shutdown.sh, and
+# invoke_terminate.py to detect whether scale-in is active without baking
+# values into user_data.
 cat > /usr/local/bin/get_master_tag.sh << 'GET_MASTER_TAG_EOF'
 ${local.get_master_tag_script}
 GET_MASTER_TAG_EOF
 chmod +x /usr/local/bin/get_master_tag.sh
 
-# ------------------------- Graceful Drain Setup (two-layer approach) -------------------------
-# Layer 1 — Pre-drain daemon (primary): monitors pool size and local CPU. When scale-in
-#   conditions are met and this is the oldest node, it detaches itself from the pool
-#   (pool target -1, no replacement spawned), drains with no time limit, then self-terminates.
-#   OCI's 15-min ACPI timeout never applies — the instance is outside the pool when draining.
-# Layer 2 — Systemd shutdown service (fallback): catches the rare case where an ACPI
-#   shutdown arrives before the daemon completes; blocks OS poweroff until drain finishes.
+# ------------------------- Graceful Drain Setup (two layers) -------------------------
+# Layer 1 — Pre-drain daemon (primary): on detach from the pool it drains with
+#   no time limit then self-terminates. OCI's 15-min ACPI timeout never applies
+#   since the instance is outside the pool while draining.
+# Layer 2 — Systemd shutdown service (fallback): catches an ACPI shutdown that
+#   arrives before the daemon finishes; blocks poweroff until drain completes.
 #
-# Both layers are ALWAYS installed regardless of fixedNumberOfMediaNodes. They self-gate
-# at runtime via the master's scale-in-mode freeform tag (read through get_master_tag.sh):
-# in fixed mode the pre-drain daemon idles and graceful_shutdown skips the function
-# invocation. Baking the toggle into user_data would force instance_configuration
-# replacement on every change, which OCI rejects (409) while the pool is attached.
+# Both layers are ALWAYS installed regardless of fixedNumberOfMediaNodes; they
+# self-gate at runtime via the master's scale-in-mode tag (get_master_tag.sh).
+# In fixed mode the daemon idles and graceful_shutdown skips the function call.
+# Baking the toggle into user_data would force instance_configuration
+# replacement (409) while the pool is attached.
 
 # Layer 1: pre-drain daemon
 cat > /usr/local/bin/openvidu-pre-drain.sh << 'PREDRAIN_EOF'
@@ -2104,7 +2115,7 @@ PREDRAIN_SVC_EOF
 
 # invoke_terminate.py — called by graceful_shutdown.sh to ask the scale-in
 # function to terminate this instance. Uses the OCI Python SDK directly to
-# avoid OCI CLI 3.83's broken --body handling for fn function invoke.
+# avoid OCI CLI 3.83's broken --body handling.
 cat > /usr/local/bin/invoke_terminate.py << 'INVOKE_TERMINATE_EOF'
 ${local.invoke_terminate_script}
 INVOKE_TERMINATE_EOF
@@ -2135,7 +2146,7 @@ KillMode=control-group
 WantedBy=halt.target reboot.target shutdown.target
 SERVICE_EOF
 
-# Allow systemd to wait indefinitely during shutdown (fallback layer)
+# Let systemd wait indefinitely during shutdown (fallback layer)
 sed -i 's/^#*DefaultTimeoutStopSec=.*/DefaultTimeoutStopSec=infinity/' /etc/systemd/system.conf
 
 systemctl daemon-reload
@@ -2151,8 +2162,8 @@ systemctl start openvidu || { echo "[OpenVidu] error starting OpenVidu"; exit 1;
 # Mark installation as complete
 echo "installation_complete" > /usr/local/bin/openvidu_install_counter.txt
 
-# Start pre-drain daemon after OpenVidu is installed (no-op in fixed mode, gated
-# at runtime by the master's scale-in-mode tag).
+# Start pre-drain daemon after OpenVidu installs (no-op in fixed mode, gated at
+# runtime by the master's scale-in-mode tag).
 systemctl start openvidu-pre-drain.service
 
 EOF
