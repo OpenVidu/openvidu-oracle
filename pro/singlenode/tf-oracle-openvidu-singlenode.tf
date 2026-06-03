@@ -18,22 +18,21 @@ resource "oci_identity_dynamic_group" "openvidu_instances_group" {
 }
 
 resource "oci_identity_policy" "openvidu_secrets_policy" {
-  # Must be at tenancy (root) level so that cross-compartment grants work
-  # when the vault lives in a different compartment than the deployment.
+  # At tenancy (root) level so cross-compartment grants work when the vault
+  # lives in a different compartment than the deployment.
   compartment_id = var.tenancy_ocid
   name           = "OpenViduSecretsPolicy"
   description    = "Allow OpenVidu instances to manage secrets and use keys"
   statements = [
     # Secrets are stored in the deployment compartment
     "Allow dynamic-group OpenViduInstanceGroup to manage secret-family in compartment id ${var.compartment_ocid}",
-    # Vault and key may be in a different compartment — use the vault's actual compartment
+    # Vault/key may be elsewhere — use the vault's actual compartment
     "Allow dynamic-group OpenViduInstanceGroup to use vaults in compartment id ${data.oci_kms_vault.openvidu_vault.compartment_id}",
     "Allow dynamic-group OpenViduInstanceGroup to use keys in compartment id ${data.oci_kms_vault.openvidu_vault.compartment_id}",
   ]
 }
 
-# OCI IAM policy propagation can take 60-120 s after creation/recreation.
-# Wait before launching the instance so instance_principal auth is ready.
+# IAM policy propagation takes 60-120s; wait before launch so instance_principal auth is ready.
 resource "time_sleep" "wait_for_iam_propagation" {
   depends_on = [
     oci_identity_dynamic_group.openvidu_instances_group,
@@ -55,8 +54,9 @@ resource "oci_objectstorage_object" "ssh_private_key" {
   object    = "openvidu_private_ssh_key_${var.stackName}.pem"
   content   = tls_private_key.openvidu_ssh_key_snpro.private_key_pem
 
-  # Es importante que el objeto se cree después del bucket
-  depends_on = [oci_objectstorage_bucket.openvidu_bucket]
+  # Object must be created after the bucket. Also depends on null_resource.empty_bucket
+  # so this object is destroyed BEFORE the bulk-delete.
+  depends_on = [oci_objectstorage_bucket.openvidu_bucket, null_resource.empty_bucket]
 }
 
 # ------------------------- Networking -------------------------
@@ -70,7 +70,7 @@ resource "oci_core_vcn" "openvidu_vcn" {
   dns_label = "openviduvcn"
 }
 
-## This is needed to make the VM reachable from the internet. It will be used in the route table to allow outbound traffic to the internet and in the security list to allow inbound traffic on necessary ports.
+# Makes the VM reachable from the internet (used by the route table + security list).
 ##-------------------------------------------------
 # Internet Gateway
 resource "oci_core_internet_gateway" "openvidu_igw" {
@@ -354,8 +354,8 @@ data "oci_objectstorage_namespace" "ns" {
 # Create credentials in deployment time
 
 
-# Customer Secret Key for S3-compatible access
-# The 'id' attribute is the S3 Access Key ID; 'key' is the S3 Secret Key (sensitive, stored in Terraform state)
+# Customer Secret Key for S3-compatible access.
+# 'id' is the S3 Access Key ID; 'key' is the S3 Secret Key (sensitive, in TF state).
 resource "oci_identity_customer_secret_key" "openvidu_s3_key" {
   display_name = "${var.stackName}-s3-key"
   user_id      = var.user_ocid
@@ -368,6 +368,37 @@ resource "oci_objectstorage_bucket" "openvidu_bucket" {
   namespace      = data.oci_objectstorage_namespace.ns.namespace
   name           = "${var.stackName}-appdata-${random_id.suffix.hex}"
   storage_tier   = "Standard"
+}
+
+# Empty the Terraform-created bucket before destroy — OCI won't delete a non-empty bucket.
+# A user-provided bucket (bucketName set) is left untouched. Ordered after the SSH key object's destroy.
+resource "null_resource" "empty_bucket" {
+  triggers = {
+    namespace = data.oci_objectstorage_namespace.ns.namespace
+    region    = var.region
+    bucket    = var.bucketName == "" ? local.bucket_app_data_name : ""
+  }
+
+  depends_on = [oci_objectstorage_bucket.openvidu_bucket]
+
+  provisioner "local-exec" {
+    when    = destroy
+    command = <<-SCRIPT
+      set -x
+      if ! command -v oci >/dev/null 2>&1; then
+        echo "[empty-bucket] WARN: 'oci' CLI not in PATH ($PATH); a non-empty bucket will block destroy."
+        exit 0
+      fi
+      B="${self.triggers.bucket}"
+      [ -z "$B" ] && exit 0
+      echo "[empty-bucket] Emptying bucket $B ..."
+      oci os object bulk-delete \
+        --namespace "${self.triggers.namespace}" \
+        --bucket-name "$B" \
+        --region "${self.triggers.region}" \
+        --force 2>/dev/null || echo "[empty-bucket] bulk-delete on $B non-zero (already empty?)"
+    SCRIPT
+  }
 }
 
 # ------------------------- Compute Instance -------------------------
@@ -438,8 +469,8 @@ data "oci_kms_vault" "openvidu_vault" {
   vault_id = var.vault_ocid != "" ? var.vault_ocid : oci_kms_vault.openvidu_vault[0].id
 }
 
-# OCI marks the vault ACTIVE before its management endpoint DNS is resolvable.
-# Wait until the hostname resolves before creating the key.
+# OCI marks the vault ACTIVE before its management endpoint DNS resolves; wait for the
+# hostname before creating the key.
 resource "null_resource" "wait_for_vault_dns" {
   count = var.vault_ocid == "" ? 1 : 0
   triggers = {
@@ -491,22 +522,18 @@ locals {
   bucket_name      = local.bucket_app_data_name
   bucket_namespace = data.oci_objectstorage_namespace.ns.namespace
 
-  # Common OCI Vault helpers, sourced by store_secret / update_config_from_secret /
-  # update_secret_from_config. Keeps a single source of truth for retry, query
-  # sanitization, and read/write logic against the vault.
+  # Common OCI Vault helpers (retry, query sanitization, read/write) sourced by
+  # store_secret / update_config_from_secret / update_secret_from_config.
   oci_helpers_script = <<-EOF
 #!/bin/bash
-# Common OCI Vault helpers. Sourced by store_secret.sh, update_config_from_secret.sh,
-# and update_secret_from_config.sh. Callers must set VAULT_ID and COMPARTMENT_ID
-# before sourcing; KEY_ID is required only when creating new secrets via
-# store_in_vault.
+# Common OCI Vault helpers. Callers must set VAULT_ID and COMPARTMENT_ID before
+# sourcing; KEY_ID is required only when creating new secrets via store_in_vault.
 #
-# We own retry instead of relying on the OCI CLI default: the default strategy
-# can spin internally for ~10 min on 429/5xx and stack under our own retry,
-# producing 20-30 min hangs during install.
+# We own retry instead of the OCI CLI default: the default can spin ~10 min on
+# 429/5xx and stack under our retry, causing 20-30 min hangs during install.
 
-# Per-attempt wall-clock cap. Vault ops typically finish in <5s; longer means
-# the API or auth layer is wedged — kill and let oci_with_retry decide.
+# Per-attempt wall-clock cap. Vault ops finish in <5s; longer means the API/auth
+# layer is wedged — kill and let oci_with_retry decide.
 : "$${OCI_CALL_TIMEOUT:=45}"
 
 oci_with_retry() {
@@ -533,9 +560,8 @@ oci_with_retry() {
   done
 }
 
-# OCI CLI --raw-output prints "Query returned empty result, no output to show."
-# to stdout instead of an empty string when JMESPath matches nothing. Filter
-# that so callers can test with [[ -z ]].
+# OCI CLI --raw-output prints "Query returned empty result..." to stdout (not an
+# empty string) when JMESPath matches nothing. Filter it so callers can test [[ -z ]].
 ocid_from_query() {
   local result
   result=$("$@")
@@ -546,8 +572,7 @@ ocid_from_query() {
   fi
 }
 
-# Read an ACTIVE secret by name. Decoded value goes to stdout; returns non-zero
-# if not found (so callers using `$(get_from_vault X)` see empty + nonzero).
+# Read an ACTIVE secret by name. Decoded value to stdout; non-zero if not found.
 get_from_vault() {
   local secret_name="$1"
   local secret_id
@@ -569,10 +594,9 @@ get_from_vault() {
     --auth instance_principal | base64 -d
 }
 
-# Store or update a secret in the vault.
-# Fast path: ACTIVE → update. Avoids cancel-secret-deletion on every call so we
-# stay below the 30/min vault rate limit. PENDING_DELETION fallback recovers
-# from manual schedule-deletion or external tooling. Create requires KEY_ID.
+# Store or update a secret. Fast path ACTIVE → update, avoiding cancel-secret-deletion
+# on every call to stay below the 30/min vault rate limit. PENDING_DELETION fallback
+# recovers from manual/external schedule-deletion. Create requires KEY_ID.
 store_in_vault() {
   local secret_name="$1"
   local secret_value="$2"
@@ -598,8 +622,8 @@ store_in_vault() {
     return
   fi
 
-  # PENDING_DELETION fallback — cancel and wait for ACTIVE; otherwise update
-  # races against CANCELLING_DELETION and OCI returns 409.
+  # PENDING_DELETION fallback — cancel and wait for ACTIVE, else update races
+  # CANCELLING_DELETION and OCI returns 409.
   secret_id=$(ocid_from_query oci_with_retry oci vault secret list \
     --compartment-id "$COMPARTMENT_ID" \
     --vault-id "$VAULT_ID" \
@@ -777,8 +801,7 @@ COMMON_ARGS=(
   "--livekit-api-secret=$LIVEKIT_API_SECRET"
 )
 
-# Only pass --meet-initial-api-key when the user provided one. Passing an empty
-# value would explicitly null out the installer default.
+# Only pass --meet-initial-api-key when set; an empty value would null out the installer default.
 if [[ "${var.initialMeetApiKey}" != '' ]]; then
   COMMON_ARGS+=("--meet-initial-api-key=$MEET_INITIAL_API_KEY")
 fi
@@ -966,9 +989,8 @@ COMPARTMENT_ID="${var.compartment_ocid}"
 INSTALL_DIR="/opt/openvidu"
 CONFIG_DIR="$${INSTALL_DIR}/config"
 
-# Skip writes when the config didn't yield a real value. Without this, an
-# unset / commented-out config key gets persisted to vault as the literal
-# string we'd otherwise have written ("" or "none"), corrupting the secret.
+# Skip writes when the config has no real value, else an unset/commented-out key
+# gets persisted to vault as the literal "" or "none", corrupting the secret.
 maybe_save() {
   local key="$1"
   local value="$2"
@@ -1029,8 +1051,7 @@ set -e
 get_value() {
     local key="$1"
     local file_path="$2"
-    # Use grep to find the line with the key, ignoring lines starting with #
-    # Use awk to split on '=' and print the second field, which is the value
+    # Grep the key's line, awk the value after '=' (strips comments/whitespace).
     local value=$(grep -E "^\s*$key\s*=" "$file_path" | awk -F= '{print $2}' | sed 's/#.*//; s/^\s*//; s/\s*$//')
     # If the value is empty, return "none"
     if [ -z "$value" ]; then
@@ -1210,11 +1231,11 @@ CONFIG_S3_EOF
     pipx \
     firewalld
 
-  # Install OCI CLI via pipx (correct method for modern Ubuntu)
+  # Install OCI CLI via pipx (required on modern Ubuntu)
   OCI_CLI_VERSION="3.83.0"
   pipx install oci-cli==$${OCI_CLI_VERSION}
   
-  # Add pipx bin directory to PATH so the 'oci' command is found
+  # Add pipx bin dir to PATH so 'oci' is found
   export HOME="/root"
   export PATH="$PATH:$HOME/.local/bin"
   
