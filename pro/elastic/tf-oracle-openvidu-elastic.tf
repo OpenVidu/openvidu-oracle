@@ -305,11 +305,25 @@ resource "null_resource" "empty_bucket" {
       B="${self.triggers.bucket}"
       [ -z "$B" ] && exit 0
       echo "[empty-bucket] Emptying bucket $B ..."
-      oci os object bulk-delete \
-        --namespace "${self.triggers.namespace}" \
-        --bucket-name "$B" \
-        --region "${self.triggers.region}" \
-        --force 2>/dev/null || echo "[empty-bucket] bulk-delete on $B non-zero (already empty?)"
+      # Re-sweep until the bucket actually reports empty. depends_on guarantees the
+      # writer instance's terminate is ISSUED before this runs, but the VM lingers
+      # during shutdown and can flush one more object AFTER the first sweep —
+      # leaving the bucket non-empty so its delete fails. Retry to absorb that window.
+      for attempt in 1 2 3 4 5 6; do
+        oci os object bulk-delete \
+          --namespace "${self.triggers.namespace}" \
+          --bucket-name "$B" \
+          --region "${self.triggers.region}" \
+          --force 2>/dev/null || true
+        REMAIN=$(oci os object list \
+          --namespace "${self.triggers.namespace}" \
+          --bucket-name "$B" \
+          --region "${self.triggers.region}" \
+          --all --query 'length(data)' --raw-output 2>/dev/null || echo "gone")
+        echo "[empty-bucket] $B attempt $attempt: remaining=$REMAIN"
+        { [ "$REMAIN" = "0" ] || [ "$REMAIN" = "gone" ]; } && break
+        sleep 15
+      done
     SCRIPT
   }
 }
