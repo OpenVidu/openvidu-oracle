@@ -551,7 +551,7 @@ locals {
 : "$${OCI_CALL_TIMEOUT:=45}"
 
 oci_with_retry() {
-  local max_attempts=3
+  local max_attempts=6
   local attempt=0
   local delay=5
   local stderr_file
@@ -628,6 +628,16 @@ store_in_vault() {
     --auth instance_principal)
 
   if [[ -n "$secret_id" ]]; then
+    # Skip if unchanged — each update adds a version and OCI caps secrets at 30.
+    local current
+    current=$(oci_with_retry oci secrets secret-bundle get \
+      --secret-id "$secret_id" \
+      --query 'data."secret-bundle-content".content' \
+      --raw-output \
+      --auth instance_principal 2>/dev/null | base64 -d 2>/dev/null)
+    if [[ "$current" == "$secret_value" ]]; then
+      return 0
+    fi
     oci_with_retry oci vault secret update-base64 \
       --secret-id "$secret_id" \
       --secret-content-content "$encoded_value" \
@@ -650,16 +660,25 @@ store_in_vault() {
     oci_with_retry oci vault secret cancel-secret-deletion \
       --secret-id "$secret_id" \
       --auth instance_principal > /dev/null
+    # Wait for ACTIVE (cancel + CANCELLING_DELETION can take a while). Generous
+    # ceiling (40 x 3s = 120s); do NOT fall through to update while non-ACTIVE.
     local i state=""
-    for i in $(seq 1 30); do
+    for i in $(seq 1 40); do
       state=$(oci_with_retry oci vault secret get \
         --secret-id "$secret_id" \
         --query 'data."lifecycle-state"' \
         --raw-output \
         --auth instance_principal 2>/dev/null || echo "")
       [[ "$state" == "ACTIVE" ]] && break
-      sleep 2
+      sleep 3
     done
+    if [[ "$state" != "ACTIVE" ]]; then
+      echo "[oci-helpers] '$secret_name' still '$state' after cancel-deletion wait; not updating (will retry next start)" >&2
+      return 1
+    fi
+    # ACTIVE on the API != immediately writable. Let the data plane settle before
+    # the version write so update-base64 doesn't race a stale-PENDING 409.
+    sleep "$${VAULT_SETTLE_SECONDS:-30}"
     oci_with_retry oci vault secret update-base64 \
       --secret-id "$secret_id" \
       --secret-content-content "$encoded_value" \
@@ -1261,6 +1280,21 @@ CONFIG_S3_EOF
   
   # Start OpenVidu
   systemctl start openvidu || { echo "[OpenVidu] error starting OpenVidu"; exit 1; }
+
+  # Warm Chrome+Xvfb so the first recording doesn't pay OCI's cold block-volume read of
+  # the Chrome binary and blow chromedp's 20s startup timeout. Best-effort, non-fatal.
+  ( set +e
+    for i in $(seq 1 60); do [ "$(docker inspect -f '{{.State.Running}}' egress 2>/dev/null)" = "true" ] && break; sleep 5; done
+    WS=$(date +%s)
+    docker exec egress sh -c '
+      CH=/opt/google/chrome/chrome
+      cat "$CH" >/dev/null 2>&1
+      XV=$(command -v Xvfb 2>/dev/null); [ -n "$XV" ] && cat "$XV" >/dev/null 2>&1
+      timeout 120 "$CH" --headless=new --no-sandbox --disable-gpu --user-data-dir=/tmp/ov-warm --dump-dom about:blank >/dev/null 2>&1
+      rm -rf /tmp/ov-warm
+    ' 2>/dev/null
+    echo "[warm-egress] chrome warm-up took $(( $(date +%s) - WS ))s"
+  ) || true
 
   # Update shared secrets
   /usr/local/bin/after_install.sh || { echo "[OpenVidu] error updating shared secrets"; exit 1; }
