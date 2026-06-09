@@ -84,7 +84,7 @@ stackName = "openvidu-singlenode"
 # --- Storage (OCI Object Storage) ---
 
 # Name of an existing OCI Object Storage bucket for application data and recordings.
-# If left empty or commented, a new bucket named "openvidu-appdata" will be created.
+# If left empty or commented, a new bucket named "<stackName>-appdata-<random-suffix>" will be created.
 # bucketName = "my-openvidu-bucket"
 
 
