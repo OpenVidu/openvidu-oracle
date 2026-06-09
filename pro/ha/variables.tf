@@ -140,31 +140,41 @@ variable "mediaNodeDiskSize" {
 }
 
 variable "initialNumberOfMediaNodes" {
-  description = "Number of initial media nodes to deploy."
+  description = "Number of initial media nodes to deploy. Ignored when fixedNumberOfMediaNodes > 0."
   type        = number
   default     = 1
 }
 
 variable "minNumberOfMediaNodes" {
-  description = "Minimum number of media nodes for autoscaling."
+  description = "Minimum number of media nodes for autoscaling. Ignored when fixedNumberOfMediaNodes > 0."
   type        = number
   default     = 1
 }
 
 variable "maxNumberOfMediaNodes" {
-  description = "Maximum number of media nodes for autoscaling."
+  description = "Maximum number of media nodes for autoscaling. Ignored when fixedNumberOfMediaNodes > 0."
   type        = number
   default     = 5
 }
 
 variable "scaleTargetCPU" {
-  description = "Target CPU percentage to trigger scale-out."
+  description = "Target CPU percentage to trigger scale-out. Ignored when fixedNumberOfMediaNodes > 0."
   type        = number
   default     = 50
 }
 
+variable "fixedNumberOfMediaNodes" {
+  description = "If > 0, deploys a fixed number of media nodes with no autoscaling and no scale-in function (initial/min/max/scaleTargetCPU and scale_in_function_image are ignored). If 0 (default), the deployment is elastic and autoscaling is enabled."
+  type        = number
+  default     = 0
+  validation {
+    condition     = var.fixedNumberOfMediaNodes >= 0
+    error_message = "fixedNumberOfMediaNodes must be >= 0."
+  }
+}
+
 # HA uses TWO buckets: app-data (recordings + user files) and cluster-data
-# (shared cluster state, SSH key). Mirrors AWS/GCP HA reference.
+# (shared cluster state, SSH key). Mirrors AWS/GCP HA references.
 variable "bucketAppDataName" {
   description = "Name of an existing OCI Object Storage bucket for application data and recordings. If empty, a new bucket will be created."
   type        = string
@@ -221,6 +231,7 @@ variable "user_ocid" {
 }
 
 variable "scale_in_function_image" {
-  description = "OCIR image URL of the scale-in OCI Function published by OpenVidu. Example: mad.ocir.io/openvidu/openvidu-scalein:main"
+  description = "OCIR image URL of the scale-in OCI Function published by OpenVidu. Override only if you are mirroring the image to your own registry; in that case follow the docs to keep it in sync. Ignored when fixedNumberOfMediaNodes > 0."
   type        = string
+  default     = "mad.ocir.io/axp2ice0s7el/openvidu-scalein:main"
 }
