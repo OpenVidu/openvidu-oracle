@@ -153,7 +153,7 @@ openviduLicense = "your-openvidu-pro-license-key"
 # --- Storage (OCI Object Storage) ---
 
 # Name of an existing OCI Object Storage bucket for application data and recordings.
-# If left empty or commented, a new bucket will be created automatically.
+# If left empty or commented, a new bucket named "<stackName>-appdata-<random-suffix>" will be created.
 # bucketName = "my-openvidu-bucket"
 
 

@@ -159,11 +159,11 @@ openviduLicense = "your-openvidu-pro-license-key"
 # (cluster-wide shared state and the generated SSH private key).
 
 # Name of an existing Object Storage bucket for application data.
-# If left empty or commented, a new one will be created automatically.
+# If left empty or commented, a new bucket named "<stackName>-appdata-<random-suffix>" will be created.
 # bucketAppDataName = "my-openvidu-appdata"
 
 # Name of an existing Object Storage bucket for cluster-wide shared state.
-# If left empty or commented, a new one will be created automatically.
+# If left empty or commented, a new bucket named "<stackName>-clusterdata-<random-suffix>" will be created.
 # bucketClusterDataName = "my-openvidu-clusterdata"
 
 
