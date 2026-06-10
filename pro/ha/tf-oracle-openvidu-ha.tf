@@ -427,7 +427,6 @@ resource "null_resource" "empty_buckets" {
 # embedded vault scripts.
 locals {
   vault_id = var.vault_ocid != "" ? var.vault_ocid : oci_kms_vault.openvidu_vault[0].id
-  key_id   = var.key_ocid != "" ? var.key_ocid : oci_kms_key.openvidu_key[0].id
 }
 
 resource "oci_kms_vault" "openvidu_vault" {
@@ -441,50 +440,22 @@ data "oci_kms_vault" "openvidu_vault" {
   vault_id = local.vault_id
 }
 
-# OCI marks the vault ACTIVE before its management-endpoint DNS resolves.
-# Wait for the hostname to resolve before creating the key.
-resource "null_resource" "wait_for_vault_dns" {
-  count = var.vault_ocid == "" ? 1 : 0
-  triggers = {
-    vault_id = oci_kms_vault.openvidu_vault[0].id
+# The KMS key is NOT created by Terraform: OCI returns the vault ACTIVE before its
+# per-vault management-endpoint DNS resolves, so a Terraform create-key call would
+# need a blocking DNS poll. Instead master #1 create-or-finds the key by display
+# name at boot (ensure_key in oci_helpers.sh), absorbing that DNS wait into its own
+# startup; the other masters wait for the key to appear. Terraform passes only
+# values available the instant the vault exists: the vault id, its compartment and
+# its management endpoint URL.
+
+# Migration safety for deployments created with the previous code (key in state):
+# drop it from state WITHOUT scheduling it for deletion — it still encrypts the
+# live secrets, and master #1 readopts it by display name. No-op on fresh applies.
+removed {
+  from = oci_kms_key.openvidu_key
+  lifecycle {
+    destroy = false
   }
-  depends_on = [oci_kms_vault.openvidu_vault]
-  provisioner "local-exec" {
-    command = <<-SH
-      HOST=$(echo "${data.oci_kms_vault.openvidu_vault.management_endpoint}" | sed 's|https://||' | sed 's|/.*||')
-      echo "[vault-dns] Waiting for $HOST to resolve (up to 15 min)..."
-      sleep 30
-      for i in $(seq 1 168); do
-        if getent hosts "$HOST" > /dev/null 2>&1 || host "$HOST" > /dev/null 2>&1 || nslookup "$HOST" > /dev/null 2>&1; then
-          echo "[vault-dns] Resolved after ~$((30 + i * 5))s."
-          exit 0
-        fi
-        echo "[vault-dns] Not resolved yet (attempt $${i}/168), retrying in 5s..."
-        sleep 5
-      done
-      echo "[vault-dns] Timeout after 15 min waiting for vault DNS." >&2
-      exit 1
-    SH
-  }
-}
-
-resource "oci_kms_key" "openvidu_key" {
-  count               = var.key_ocid == "" ? 1 : 0
-  compartment_id      = var.compartment_ocid
-  display_name        = "${var.stackName}-key"
-  management_endpoint = data.oci_kms_vault.openvidu_vault.management_endpoint
-
-  key_shape {
-    algorithm = "AES"
-    length    = 32
-  }
-
-  depends_on = [null_resource.wait_for_vault_dns]
-}
-
-data "oci_kms_key" "openvidu_key" {
-  management_endpoint = data.oci_kms_vault.openvidu_vault.management_endpoint
-  key_id              = local.key_id
 }
 
 # ------------------------- HA deployment generation token -------------------------
@@ -573,7 +544,6 @@ resource "oci_core_instance" "openvidu_master_node" {
 
   # NSG rules + NLB resource only (NOT backends/listeners → cycle): net path ready before boot.
   depends_on = [
-    time_sleep.wait_for_iam_propagation,
     oci_network_load_balancer_network_load_balancer.openvidu_nlb,
     oci_core_network_security_group_security_rule.nsg_egress,
     oci_core_network_security_group_security_rule.nlb_internet_ingress,
@@ -915,9 +885,12 @@ resource "oci_identity_policy" "media_node_predrain_policy" {
     "allow dynamic-group ${oci_identity_dynamic_group.openvidu_instances_dg.name} to manage secret-family in compartment id ${var.compartment_ocid}",
     "allow dynamic-group ${oci_identity_dynamic_group.openvidu_instances_dg.name} to read secret-bundles in compartment id ${var.compartment_ocid}",
     "allow dynamic-group ${oci_identity_dynamic_group.openvidu_instances_dg.name} to read metrics in compartment id ${var.compartment_ocid}",
-    # Vault and key may be in a different compartment — use the vault's actual compartment
+    # Vault and key may be in a different compartment — use the vault's actual compartment.
+    # "manage keys" (not just "use"): master #1 now create-or-finds the KMS key
+    # itself at boot (see ensure_key in oci_helpers.sh), so Terraform no longer
+    # creates it and no longer waits for the vault management-endpoint DNS.
     "allow dynamic-group ${oci_identity_dynamic_group.openvidu_instances_dg.name} to use vaults in compartment id ${data.oci_kms_vault.openvidu_vault.compartment_id}",
-    "allow dynamic-group ${oci_identity_dynamic_group.openvidu_instances_dg.name} to use keys in compartment id ${data.oci_kms_vault.openvidu_vault.compartment_id}",
+    "allow dynamic-group ${oci_identity_dynamic_group.openvidu_instances_dg.name} to manage keys in compartment id ${data.oci_kms_vault.openvidu_vault.compartment_id}",
     "allow dynamic-group ${oci_identity_dynamic_group.openvidu_instances_dg.name} to use fn-invocation in compartment id ${var.compartment_ocid}",
     "allow dynamic-group ${oci_identity_dynamic_group.openvidu_instances_dg.name} to use fn-function in compartment id ${var.compartment_ocid}",
     # Object Storage scale-in lock (scalein.lock) — atomic CAS via ETag.
@@ -957,15 +930,9 @@ resource "oci_identity_policy" "scale_in_fn_policy" {
   ]
 }
 
-# OCI IAM policy propagation takes 60-120s after creation. Wait before launching
-# masters so instance_principal auth is ready.
-resource "time_sleep" "wait_for_iam_propagation" {
-  depends_on = [
-    oci_identity_dynamic_group.openvidu_instances_dg,
-    oci_identity_policy.media_node_predrain_policy,
-  ]
-  create_duration = "120s"
-}
+# OCI IAM policy propagation (60-120s) is no longer a Terraform gate: masters
+# launch immediately and wait for it actively at boot (wait_for_vault_ready in
+# oci_helpers.sh) so the apply isn't blocked.
 
 # Function Application: hosts the scale-in function and injects runtime config.
 # Config vars are set by Terraform and read at invocation via os.environ — no
@@ -1223,9 +1190,105 @@ ocid_from_query() {
   fi
 }
 
+# Active wait for IAM-policy propagation + vault reachability. Replaces the
+# Terraform time_sleep.wait_for_iam_propagation gate: masters launch right away and
+# absorb the 60-120 s propagation during their own boot instead of delaying the
+# apply. Probes a real instance_principal call; marker lives in tmpfs so it runs
+# once per boot (re-probed after a reboot, by then propagation is long done).
+wait_for_vault_ready() {
+  [[ -f /run/ov_vault_ready ]] && return 0
+  local deadline
+  deadline=$(( $(date +%s) + 900 ))
+  until timeout "$OCI_CALL_TIMEOUT" oci vault secret list \
+    --compartment-id "$COMPARTMENT_ID" \
+    --vault-id "$VAULT_ID" \
+    --limit 1 \
+    --auth instance_principal >/dev/null 2>&1; do
+    if [[ $(date +%s) -ge $deadline ]]; then
+      echo "[oci-helpers] IAM/vault not ready after 15 min" >&2
+      return 1
+    fi
+    echo "[oci-helpers] waiting for IAM propagation + vault access..." >&2
+    sleep 5
+  done
+  touch /run/ov_vault_ready
+}
+
+# Resolve KEY_ID lazily — only the secret-create path needs it. Honours a
+# user-provided key (KEY_OCID); otherwise create-or-finds the deployment key by
+# display name through the vault management endpoint. Doubles as the active wait
+# for that per-vault management-endpoint DNS (OCI returns the vault ACTIVE before
+# the hostname resolves) — replaces the Terraform null_resource.wait_for_vault_dns.
+# HA single-writer: only master #1 creates the shared key (parallel creates would
+# make duplicate keys); the other masters wait for it to appear.
+ensure_key() {
+  [[ -n "$${KEY_ID:-}" ]] && return 0
+  if [[ -n "$${KEY_OCID:-}" ]]; then
+    KEY_ID="$KEY_OCID"
+    return 0
+  fi
+  # Wait for the management endpoint DNS + IAM before touching it.
+  local deadline
+  deadline=$(( $(date +%s) + 900 ))
+  until timeout "$OCI_CALL_TIMEOUT" oci kms management key list \
+    --compartment-id "$KEY_COMPARTMENT_ID" \
+    --endpoint "$MANAGEMENT_ENDPOINT" \
+    --limit 1 \
+    --auth instance_principal >/dev/null 2>&1; do
+    if [[ $(date +%s) -ge $deadline ]]; then
+      echo "[oci-helpers] vault management endpoint not ready after 15 min" >&2
+      return 1
+    fi
+    echo "[oci-helpers] waiting for vault management endpoint DNS..." >&2
+    sleep 5
+  done
+  # Reuse an existing key (idempotent across reboots / re-applies / recycled vaults).
+  KEY_ID=$(ocid_from_query oci_with_retry oci kms management key list \
+    --compartment-id "$KEY_COMPARTMENT_ID" \
+    --endpoint "$MANAGEMENT_ENDPOINT" \
+    --query "data[?\"display-name\"=='$KEY_DISPLAY_NAME' && \"lifecycle-state\"=='ENABLED'].id | [0]" \
+    --raw-output \
+    --auth instance_principal)
+  [[ -n "$KEY_ID" ]] && return 0
+  # Absent. Only master #1 creates; followers poll until it shows up.
+  local masternum
+  masternum=$(curl -sf -H "Authorization: Bearer Oracle" http://169.254.169.254/opc/v2/instance/ 2>/dev/null | jq -r '.metadata.masterNodeNum // "1"')
+  if [[ "$masternum" != "1" ]]; then
+    local kdeadline
+    kdeadline=$(( $(date +%s) + 600 ))
+    while [[ -z "$KEY_ID" ]]; do
+      if [[ $(date +%s) -ge $kdeadline ]]; then
+        echo "[oci-helpers] master #$masternum: key '$KEY_DISPLAY_NAME' did not appear after 10 min" >&2
+        return 1
+      fi
+      sleep 5
+      KEY_ID=$(ocid_from_query oci_with_retry oci kms management key list \
+        --compartment-id "$KEY_COMPARTMENT_ID" \
+        --endpoint "$MANAGEMENT_ENDPOINT" \
+        --query "data[?\"display-name\"=='$KEY_DISPLAY_NAME' && \"lifecycle-state\"=='ENABLED'].id | [0]" \
+        --raw-output \
+        --auth instance_principal)
+    done
+    return 0
+  fi
+  # Master #1 — create it. Create + reach ENABLED can exceed the per-call timeout,
+  # so widen it for this call only.
+  KEY_ID=$(OCI_CALL_TIMEOUT=180 oci_with_retry oci kms management key create \
+    --compartment-id "$KEY_COMPARTMENT_ID" \
+    --endpoint "$MANAGEMENT_ENDPOINT" \
+    --display-name "$KEY_DISPLAY_NAME" \
+    --key-shape '{"algorithm":"AES","length":32}' \
+    --wait-for-state ENABLED \
+    --query 'data.id' \
+    --raw-output \
+    --auth instance_principal) || return 1
+  [[ -n "$KEY_ID" && "$KEY_ID" != "null" ]]
+}
+
 # Read an ACTIVE secret by name. Decoded value to stdout; non-zero if not found
 # (so `$(get_from_vault X)` callers see empty + nonzero).
 get_from_vault() {
+  wait_for_vault_ready || return 1
   local secret_name="$1"
   local secret_id
   secret_id=$(ocid_from_query oci_with_retry oci vault secret list \
@@ -1251,6 +1314,7 @@ get_from_vault() {
 # the 30/min vault rate limit). PENDING_DELETION fallback recovers from manual
 # schedule-deletion or external tooling. Create requires KEY_ID.
 store_in_vault() {
+  wait_for_vault_ready || return 1
   local secret_name="$1"
   local secret_value="$2"
   local encoded_value
@@ -1331,10 +1395,7 @@ store_in_vault() {
     return
   fi
 
-  if [[ -z "$${KEY_ID:-}" ]]; then
-    echo "[oci-helpers] Cannot create '$secret_name': KEY_ID not set" >&2
-    return 1
-  fi
+  ensure_key || { echo "[oci-helpers] Cannot create '$secret_name': key unavailable" >&2; return 1; }
   oci_with_retry oci vault secret create-base64 \
     --compartment-id "$COMPARTMENT_ID" \
     --secret-name "$secret_name" \
@@ -1959,7 +2020,10 @@ export PATH="$PATH:$HOME/.local/bin"
 export OCI_CLI_DISABLE_DEFAULT_RETRY=True
 
 VAULT_ID="${local.vault_id}"
-KEY_ID="${local.key_id}"
+KEY_OCID="${var.key_ocid}"
+KEY_COMPARTMENT_ID="${data.oci_kms_vault.openvidu_vault.compartment_id}"
+MANAGEMENT_ENDPOINT="${data.oci_kms_vault.openvidu_vault.management_endpoint}"
+KEY_DISPLAY_NAME="${var.stackName}-key"
 COMPARTMENT_ID="${var.compartment_ocid}"
 
 # shellcheck source=/dev/null
@@ -2037,7 +2101,10 @@ MASTER_NODE_NUM=$(curl -sf -H "Authorization: Bearer Oracle" http://169.254.169.
 [[ "$MASTER_NODE_NUM" == "1" ]] || { echo "[update_secret_from_config] not master #1 (num='$MASTER_NODE_NUM'); skipping vault writes"; exit 0; }
 
 VAULT_ID="${local.vault_id}"
-KEY_ID="${local.key_id}"
+KEY_OCID="${var.key_ocid}"
+KEY_COMPARTMENT_ID="${data.oci_kms_vault.openvidu_vault.compartment_id}"
+MANAGEMENT_ENDPOINT="${data.oci_kms_vault.openvidu_vault.management_endpoint}"
+KEY_DISPLAY_NAME="${var.stackName}-key"
 COMPARTMENT_ID="${var.compartment_ocid}"
 
 # shellcheck source=/dev/null
@@ -2130,7 +2197,10 @@ export PATH="$PATH:$HOME/.local/bin"
 export OCI_CLI_DISABLE_DEFAULT_RETRY=True
 
 VAULT_ID="${local.vault_id}"
-KEY_ID="${local.key_id}"
+KEY_OCID="${var.key_ocid}"
+KEY_COMPARTMENT_ID="${data.oci_kms_vault.openvidu_vault.compartment_id}"
+MANAGEMENT_ENDPOINT="${data.oci_kms_vault.openvidu_vault.management_endpoint}"
+KEY_DISPLAY_NAME="${var.stackName}-key"
 COMPARTMENT_ID="${var.compartment_ocid}"
 
 # shellcheck source=/dev/null
