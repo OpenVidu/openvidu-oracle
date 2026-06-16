@@ -1340,7 +1340,7 @@ set -e
 
 OPENVIDU_VERSION=main
 DOMAIN=
-YQ_VERSION=v4.52.4
+YQ_VERSION=v4.53.3
 echo "DPkg::Lock::Timeout \"-1\";" > /etc/apt/apt.conf.d/99timeout
 
 apt-get update && apt-get install -y \
@@ -1864,7 +1864,7 @@ CONFIG_S3_EOF
 
   # Install OCI CLI via pipx (correct method on modern Ubuntu)
   export HOME="/root"
-  OCI_CLI_VERSION="3.83.0"
+  OCI_CLI_VERSION="3.87.0"
   pipx install oci-cli==$${OCI_CLI_VERSION}
   export PATH="$PATH:$HOME/.local/bin"
 
@@ -2127,7 +2127,7 @@ apt-get update && apt-get install -y \
 
 # Install OCI CLI via pipx — needed by install script and pre-drain daemon
 export HOME="/root"
-OCI_CLI_VERSION="3.83.0"
+OCI_CLI_VERSION="3.87.0"
 pipx install oci-cli==$${OCI_CLI_VERSION}
 export PATH="$PATH:$HOME/.local/bin"
 
