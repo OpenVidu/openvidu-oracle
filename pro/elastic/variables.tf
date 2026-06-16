@@ -218,9 +218,15 @@ variable "user_ocid" {
 }
 
 variable "scale_in_function_image" {
-  description = "OCIR image URL of the scale-in OCI Function published by OpenVidu. Override only if you are mirroring the image to your own registry; in that case follow the docs to keep it in sync. Ignored when fixedNumberOfMediaNodes > 0."
+  description = "OCIR image URL of the scale-in OCI Function. You must mirror the OpenVidu scale-in image into your own OCIR, in the SAME region as this deployment, and set it here as <region-key>.ocir.io/<your-namespace>/openvidu-scalein:<tag>. Mandatory for elastic deployments; ignored when fixedNumberOfMediaNodes > 0."
   type        = string
-  default     = "mad.ocir.io/axp2ice0s7el/openvidu-scalein:main"
+  default     = null
+  nullable    = true
+
+  validation {
+    condition     = var.fixedNumberOfMediaNodes > 0 || try(length(trimspace(var.scale_in_function_image)) > 0, false)
+    error_message = "scale_in_function_image is required for elastic deployments (fixedNumberOfMediaNodes = 0). Mirror the scale-in image to your own OCIR in the same region as this deployment and set it to <region-key>.ocir.io/<your-namespace>/openvidu-scalein:<tag>."
+  }
 }
 
 
