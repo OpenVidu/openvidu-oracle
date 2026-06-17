@@ -53,13 +53,13 @@ variable "domainName" {
 }
 
 variable "ownPublicCertificate" {
-  description = "If certificate type is 'owncert', this parameter will be used to specify the public certificate URL"
+  description = "If certificate type is 'owncert', this parameter will be used to specify the public certificate in base64 format"
   type        = string
   default     = ""
 }
 
 variable "ownPrivateCertificate" {
-  description = "If certificate type is 'owncert', this parameter will be used to specify the private certificate URL"
+  description = "If certificate type is 'owncert', this parameter will be used to specify the private certificate in base64 format"
   type        = string
   default     = ""
 }

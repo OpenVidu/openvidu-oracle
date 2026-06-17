@@ -131,7 +131,7 @@ scale_in_function_image = "mad.ocir.io/<your-namespace>/openvidu-scalein:main"
 # Leave empty or commented to let OCI allocate a new public IP.
 # publicIpAddress = "ocid1.publicip.oc1.eu-frankfurt-1.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
-# Only if using 'owncert': public certificate and private key contents in base64.
+# Only if using 'owncert': public certificate and private key contents in base64 format.
 # ownPublicCertificate  = "base64_of_your_public_certificate.pem"
 # ownPrivateCertificate = "base64_of_your_private_certificate.pem"
 
