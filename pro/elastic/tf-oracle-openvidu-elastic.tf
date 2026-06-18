@@ -796,7 +796,7 @@ locals {
   # all others (VM.Standard.E*, .Standard3/2, BM.Standard2...) are x86.
   is_arm_instance = startswith(var.masterNodeShape, "VM.Standard.A") || startswith(var.masterNodeShape, "BM.Standard.A")
   yq_arch         = local.is_arm_instance ? "arm64" : "amd64"
-  yq_sha256       = local.is_arm_instance ? "10a4a2093090363a00b55ad52e132a082f9652970cb8f1ad35a1ae048b917e6e" : "3fa3c1c32d94520102ea4d853d03c3ab907867d964540e896410ad8a7fc6c8f7"
+  yq_sha256       = local.is_arm_instance ? "42600522e7455282e11c71c9fc62dc8e98b05bcdb830210fe16eb673a871e866" : "b4077cab0f9ee5ce8381e602d090daa69a0afb7e57eb9a5b20e9cb416d7f6794"
 
   # Common OCI Vault helpers (retry, query sanitization, read/write logic),
   # sourced by store_secret / update_config_from_secret / update_secret_from_config.
