@@ -32,7 +32,7 @@ openviduLicense = "your-openvidu-pro-license-key"
 # OpenVidu scale-in image into your OWN OCIR, in the SAME region as
 # this deployment, and set it here. Format:
 # <region-key>.ocir.io/<your-namespace>/<repo>:<tag>.
-scale_in_function_image = "mad.ocir.io/<your-namespace>/openvidu-scalein:main"
+scale_in_function_image = "mad.ocir.io/<your-namespace>/openvidu-oci-scalein:main"
 
 # --- Region and Availability Domain ---
 
