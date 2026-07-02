@@ -35,14 +35,6 @@ resource "random_id" "suffix" {
   byte_length = 3
 }
 
-# Random suffix for the auto-generated sslip.io domain — one value shared by all 4 masters.
-resource "random_string" "domain_suffix" {
-  length  = 8
-  special = false
-  upper   = false
-  numeric = false
-}
-
 # ---------------------------- SSH Key -------------------------
 
 resource "tls_private_key" "openvidu_ssh_key_ha" {
@@ -1123,11 +1115,11 @@ resource "oci_network_load_balancer_listener" "master" {
 }
 
 locals {
-  # NLB public IP (the HA entry point), used to derive a sslip.io domain when no
-  # domain is given. OCI returns `ip_addresses` as a list; the public one has
+  # NLB public IP (the HA entry point), used as the domain when no domain is
+  # given. OCI returns `ip_addresses` as a list; the public one has
   # `is_public = true`.
   nlb_ip_address = one([for ip in oci_network_load_balancer_network_load_balancer.openvidu_nlb.ip_addresses : ip.ip_address if ip.is_public])
-  domain_name    = var.domainName != "" ? var.domainName : "openvidu-${random_string.domain_suffix.result}-${replace(local.nlb_ip_address, ".", "-")}.sslip.io"
+  domain_name    = var.domainName != "" ? var.domainName : local.nlb_ip_address
 
   # OCI ARM (Ampere) shapes use "VM.Standard.A" / "BM.Standard.A" prefixes; all
   # others (VM.Standard.E*, VM.Standard3/2, BM.Standard2...) are x86.

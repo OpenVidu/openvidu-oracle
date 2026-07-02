@@ -116,7 +116,7 @@ scale_in_function_image = "mad.ocir.io/<your-namespace>/openvidu-scalein:main"
 
 # Certificate type. Default: "letsencrypt".
 # Options:
-#   - "letsencrypt" (Recommended for production, requires domain or uses sslip.io).
+#   - "letsencrypt" (Recommended for production, works with a domain or the public IP).
 #   - "selfsigned"  (For local testing only, browser will show warning).
 #   - "owncert"     (If you already have your own certificate files).
 # Leave commented to use the default.
@@ -124,7 +124,7 @@ scale_in_function_image = "mad.ocir.io/<your-namespace>/openvidu-scalein:main"
 
 # Your real domain name (e.g., "video.mycompany.com").
 # Required if using 'owncert'. Recommended for 'letsencrypt'.
-# Leave empty or commented to use an automatic sslip.io domain.
+# Leave empty or commented to use the public IP automatically.
 # domainName = "video.mycompany.com"
 
 # Only if using 'owncert': public certificate and private key contents in base64 format.
