@@ -790,7 +790,7 @@ resource "oci_logging_log" "scale_in_fn_log" {
 
 
 locals {
-  domain_name = var.domainName != "" ? var.domainName : "openvidu-${replace(oci_core_instance.openvidu_master_node.public_ip, ".", "-")}.sslip.io"
+  domain_name = var.domainName != "" ? var.domainName : oci_core_instance.openvidu_master_node.public_ip
 
   # ARM (Ampere) shapes use "VM.Standard.A" / "BM.Standard.A" prefixes;
   # all others (VM.Standard.E*, .Standard3/2, BM.Standard2...) are x86.
@@ -1414,8 +1414,7 @@ EXTERNAL_IP=$(get_meta "vnics/" | jq -r '.[0].publicIp // empty' 2>/dev/null) ||
 
 if [[ "${var.domainName}" == "" ]]; then
   [ ! -d "/usr/share/openvidu" ] && mkdir -p /usr/share/openvidu
-  RANDOM_DOMAIN_STRING=$(tr -dc 'a-z' < /dev/urandom | head -c 8)
-  DOMAIN="openvidu-$RANDOM_DOMAIN_STRING-$(echo $EXTERNAL_IP | tr '.' '-').sslip.io"
+  DOMAIN="$EXTERNAL_IP"
 else
   DOMAIN="${var.domainName}"
 fi
