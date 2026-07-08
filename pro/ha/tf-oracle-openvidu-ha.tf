@@ -1703,6 +1703,10 @@ DOMAIN=
 YQ_VERSION=v4.53.3
 echo "DPkg::Lock::Timeout \"-1\";" > /etc/apt/apt.conf.d/99timeout
 
+# FIX-OR-1: bounded retry around transient apt bootstrap (flaky mirror/throttling).
+# Idempotent; healthy deploy succeeds on the 1st attempt. The plain apt-get below
+# is kept as the final attempt so a real failure still surfaces under set -e.
+for i in 1 2 3 4 5; do apt-get update && apt-get install -y curl unzip jq wget ca-certificates gnupg lsb-release openssl firewalld && break || sleep $((i*15)); done
 apt-get update && apt-get install -y \
   curl \
   unzip \
@@ -1813,6 +1817,13 @@ if [[ "$MASTER_NODE_NUM" == "1" ]]; then
     DOMAIN="${var.domainName}"
   fi
   DOMAIN="$(/usr/local/bin/store_secret.sh save DOMAIN_NAME "$DOMAIN")"
+
+  # Publish the derived URL secrets early so previous-deployment media nodes and
+  # clients can read them before after_install re-writes the same values.
+  /usr/local/bin/store_secret.sh save OPENVIDU_URL "https://$DOMAIN/" >/dev/null
+  /usr/local/bin/store_secret.sh save LIVEKIT_URL "wss://$DOMAIN/" >/dev/null
+  /usr/local/bin/store_secret.sh save DASHBOARD_URL "https://$DOMAIN/dashboard/" >/dev/null
+  /usr/local/bin/store_secret.sh save GRAFANA_URL "https://$DOMAIN/grafana/" >/dev/null
 
   # Meet initial admin user and password
   MEET_INITIAL_ADMIN_USER="$(/usr/local/bin/store_secret.sh save MEET_INITIAL_ADMIN_USER "admin")"
@@ -2265,7 +2276,7 @@ RESTART_EOF
 chmod +x /usr/local/bin/restart.sh
 
 # Installation already done? (reboot path)
-if [ -f /usr/local/bin/openvidu_install_counter.txt ]; then
+if [ "$(cat /usr/local/bin/openvidu_install_counter.txt 2>/dev/null)" = "installation_complete" ]; then
   /usr/local/bin/restart.sh || { echo "[OpenVidu] error restarting OpenVidu"; exit 1; }
 else
   # install.sh
@@ -2323,6 +2334,10 @@ CONFIG_S3_EOF
   chmod +x /usr/local/bin/config_s3.sh
 
   echo "DPkg::Lock::Timeout \"-1\";" > /etc/apt/apt.conf.d/99timeout
+  # FIX-OR-1: bounded retry around transient apt bootstrap (flaky mirror/throttling).
+  # Idempotent; healthy deploy succeeds on the 1st attempt. The plain apt-get below
+  # is kept as the final attempt so a real failure still surfaces under set -e.
+  for i in 1 2 3 4 5; do apt-get update && apt-get install -y curl jq wget ca-certificates gnupg lsb-release openssl pipx && break || sleep $((i*15)); done
   apt-get update && apt-get install -y \
     curl \
     jq \
@@ -2336,6 +2351,10 @@ CONFIG_S3_EOF
   # Install OCI CLI via pipx (correct method on modern Ubuntu)
   export HOME="/root"
   OCI_CLI_VERSION="3.87.0"
+  # FIX-OR-1: bounded retry around transient pipx/PyPI install (throttled index).
+  # Idempotent; healthy deploy succeeds on the 1st attempt. The plain pipx below
+  # is kept as the final attempt so a real failure still surfaces under set -e.
+  for i in 1 2 3 4 5; do pipx install oci-cli==$${OCI_CLI_VERSION} && break || sleep $((i*15)); done
   pipx install oci-cli==$${OCI_CLI_VERSION}
   export PATH="$PATH:$HOME/.local/bin"
 
