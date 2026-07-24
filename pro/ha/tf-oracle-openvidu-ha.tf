@@ -534,10 +534,7 @@ resource "oci_core_instance" "openvidu_master_node" {
     "scale-in-fn-id" = try(oci_functions_function.scale_in_fn[0].id, "")
   }
 
-  # NSG rules only (net path ready before boot). The NLB is intentionally NOT a
-  # dependency: master #1 resolves the NLB public IP at RUNTIME (resolve_nlb_public_ip
-  # in install.sh), so the masters boot in parallel with the NLB instead of waiting
-  # for it to be provisioned (which used to add several idle minutes at the start).
+  # NSG rules only; NLB is deliberately excluded — its IP is resolved at runtime, not via depends_on.
   depends_on = [
     oci_core_network_security_group_security_rule.nsg_egress,
     oci_core_network_security_group_security_rule.nlb_internet_ingress,
@@ -879,10 +876,7 @@ resource "oci_identity_policy" "media_node_predrain_policy" {
     "allow dynamic-group ${oci_identity_dynamic_group.openvidu_instances_dg.name} to manage secret-family in compartment id ${var.compartment_ocid}",
     "allow dynamic-group ${oci_identity_dynamic_group.openvidu_instances_dg.name} to read secret-bundles in compartment id ${var.compartment_ocid}",
     "allow dynamic-group ${oci_identity_dynamic_group.openvidu_instances_dg.name} to read metrics in compartment id ${var.compartment_ocid}",
-    # Master #1 resolves the NLB public IP at boot (when domainName is empty) to
-    # derive the deployment domain — see resolve_nlb_public_ip in install.sh. This
-    # replaces baking local.domain_name into user_data, which coupled every master
-    # to the NLB at Terraform time.
+    # Lets master #1 read the NLB's public IP at boot when domainName is empty.
     "allow dynamic-group ${oci_identity_dynamic_group.openvidu_instances_dg.name} to read network-load-balancers in compartment id ${var.compartment_ocid}",
     # Vault and key may be in a different compartment — use the vault's actual compartment.
     # "manage keys" (not just "use"): master #1 now create-or-finds the KMS key
@@ -1705,8 +1699,7 @@ YQ_VERSION=v4.53.3
 echo "DPkg::Lock::Timeout \"-1\";" > /etc/apt/apt.conf.d/99timeout
 
 # FIX-OR-1: bounded retry around transient apt bootstrap (flaky mirror/throttling).
-# Idempotent; a healthy deploy succeeds on the 1st attempt. Exits non-zero (under
-# set -e) if all 5 attempts fail so a real failure still surfaces.
+# Idempotent; exits non-zero after 5 failed attempts (set -e surfaces it).
 for i in 1 2 3 4 5; do
   apt-get update && apt-get install -y curl unzip jq wget ca-certificates gnupg lsb-release openssl firewalld && break
   if [ "$i" = 5 ]; then echo "[install] apt bootstrap failed after 5 attempts" >&2; exit 1; fi
@@ -1796,11 +1789,7 @@ PRIVATE_IP=$(curl -sf -H "Authorization: Bearer Oracle" http://169.254.169.254/o
 # the loop converges even if one races ahead.
 /usr/local/bin/store_secret.sh save "MASTER_NODE_$${MASTER_NODE_NUM}_PRIVATE_IP" "$DEPLOY_GEN|$PRIVATE_IP" >/dev/null
 
-# Resolve the NLB public IP at runtime (only master #1, only when no domainName is
-# given). Polls the NLB by exact display-name and reads its public IP. This is what
-# decouples the masters from the NLB at Terraform time: they no longer bake
-# local.domain_name (which made every master wait for the NLB to be provisioned).
-# The poll absorbs both NLB-not-created-yet and IAM-propagation lag. Bounded to 20 min.
+# Master #1 only: poll for the NLB's public IP by display-name, bounded to 20 min.
 resolve_nlb_public_ip() {
   local deadline ip
   deadline=$(( $(date +%s) + 1200 ))
@@ -1831,25 +1820,18 @@ if [[ "$MASTER_NODE_NUM" == "1" ]]; then
   echo "[ha-bootstrap] Master #1 — generating cluster secrets."
 
   # Mark not-ready first so previous-deployment media nodes don't read stale
-  # values pointing to dead masters. This first store also create-or-finds the KMS
-  # key on a fresh vault (via ensure_key), so it exists before bootstrap_secrets.py runs.
+  # values pointing to dead masters.
+  # Also create-or-finds the KMS key on a fresh vault, before bootstrap_secrets.py runs.
   /usr/local/bin/store_secret.sh save ALL_SECRETS_GENERATED "false" >/dev/null
 
-  # Domain: var.domainName if set; otherwise the NLB public IP resolved at RUNTIME.
-  # Resolving here — instead of baking local.domain_name into user_data — removes
-  # the masters' Terraform-time dependency on the NLB.
+  # Domain: var.domainName if set, else the NLB public IP resolved at runtime.
   if [[ "${var.domainName}" == "" ]]; then
     DOMAIN="$(resolve_nlb_public_ip)" || { echo "[ha-bootstrap] could not resolve NLB public IP" >&2; exit 1; }
   else
     DOMAIN="${var.domainName}"
   fi
 
-  # Consolidated single-process secret generation. Replaces ~20 store_secret.sh
-  # calls (each spawning the oci CLI 2-3x) with one Python process reusing a single
-  # SDK signer. It writes ALL cluster secrets to the vault, stamps
-  # ALL_SECRETS_GENERATED=<gen> LAST, and prints the resolved values as JSON so this
-  # node configures its own install without ~20 vault reads. store_secret.sh is kept
-  # for the other flows (after_install, followers, media, config reconciliation).
+  # Generates all cluster secrets in one process and returns them as JSON.
   SECRETS_JSON="$(/usr/local/bin/bootstrap_secrets.sh "$DOMAIN" "$DEPLOY_GEN" "$OPENVIDU_VERSION")"
   DOMAIN="$(echo "$SECRETS_JSON" | jq -r '.DOMAIN_NAME')"
   MEET_INITIAL_ADMIN_USER="$(echo "$SECRETS_JSON" | jq -r '.MEET_INITIAL_ADMIN_USER')"
@@ -1941,9 +1923,7 @@ if [[ -z "$IP1" || -z "$IP2" || -z "$IP3" || -z "$IP4" ]]; then
 fi
 MASTER_NODE_PRIVATE_IP_LIST="$IP1,$IP2,$IP3,$IP4"
 
-# Build install command for HA master node. Fetch to a file with retries and
-# verify it is non-empty before running: `sh <(curl ...)` silently runs an EMPTY
-# script (exit 0) if curl fails transiently, so the node would look "installed".
+# Fetch installer to a file first: `sh <(curl ...)` would silently no-op if curl failed.
 INSTALLER=/tmp/install_ov_master_node.sh
 curl -fsSL --retry 8 --retry-all-errors --retry-delay 5 \
   -o "$INSTALLER" "http://get.openvidu.io/pro/ha/$OPENVIDU_VERSION/install_ov_master_node.sh"
@@ -2254,10 +2234,7 @@ else
 fi
 EOF
 
-  # Wrapper for bootstrap_secrets.py (master #1 only). Resolves the pipx oci-cli
-  # venv Python (which ships the oci SDK), bakes the Terraform-provided config as
-  # OV_* env vars, and runs the consolidated generator. Args:
-  # <domain> <deployment-generation> <openvidu-version>.
+  # Wrapper for bootstrap_secrets.py: exports OV_* config, then execs it. Args: <domain> <deploy-gen> <version>.
   bootstrap_secrets_wrapper_script = <<-EOF
 #!/bin/bash
 set -e
@@ -2281,30 +2258,16 @@ export OV_DOMAIN="$1"
 export OV_DEPLOY_GEN="$2"
 export OV_OPENVIDU_VERSION="$3"
 
-# Robustly resolve the oci-cli venv interpreter from the CLI shebang; that venv
-# already has the oci Python SDK used by bootstrap_secrets.py.
+# Must run with the oci-cli venv's Python (has the oci SDK), resolved via its shebang.
 OCI_PY=$(head -1 "$(command -v oci)" | cut -c3-)
 exec "$OCI_PY" /usr/local/bin/bootstrap_secrets.py
 EOF
 
-  # Consolidated one-process generator for the HA cluster secrets (master #1).
-  # Replaces ~20 store_secret.sh calls (each spawning the oci CLI 2-3x). Pure logic:
-  # all config arrives via OV_* env vars from the wrapper (no Terraform interpolation
-  # inside — keep it free of ${} / %{}).
+  # Terraform-interpolated heredoc: escape a literal $ as $$ (no bare ${...} below).
   bootstrap_secrets_py = <<-PYEOF
 #!/usr/bin/env python3
-"""Consolidated one-process generator for the HA cluster secrets (master #1).
-
-Replaces ~20 store_secret.sh invocations (each spawning the oci CLI 2-3x) with a
-single process that reuses one Instance-Principals SDK signer. Writes every cluster
-secret to the OCI Vault and stamps ALL_SECRETS_GENERATED=<gen> LAST, then prints the
-resolved values as a JSON object on stdout so master #1 configures its own install
-without re-reading the vault. All logging goes to stderr to keep stdout clean JSON.
-
-Per-secret semantics mirror store_in_vault in oci_helpers.sh: ACTIVE -> update (skip
-if unchanged); PENDING_DELETION -> cancel + wait ACTIVE + settle + update; otherwise
-create. The KMS key is created before this runs (by the first store_secret.sh call);
-here it is only looked up by display name.
+"""Generates all HA cluster secrets in one process (master #1 only). Writes them to
+the vault (ALL_SECRETS_GENERATED last) and prints them as JSON on stdout; logs to stderr.
 """
 import base64
 import json
@@ -2354,19 +2317,17 @@ _key_id = None
 
 
 def rand_token(length, prefix=""):
-    # Match store_secret.sh 'generate': <length> chars from [A-Za-z0-9] (the 62-symbol
-    # alphabet its base64|tr pipeline produced), optional prefix. secrets is the CSPRNG.
+    # Same alphabet as store_secret.sh's 'generate' ([A-Za-z0-9]), for parity.
     alphabet = string.ascii_letters + string.digits
     return prefix + "".join(secrets.choice(alphabet) for _ in range(length))
 
 
 def call(desc, func, *args, **kwargs):
-    # Own retry/backoff, like oci_with_retry (the SDK default can spin ~10 min).
     delay = 5
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
             return func(*args, **kwargs)
-        except Exception as exc:  # retry on any transient failure, like the shell
+        except Exception as exc:  # broad on purpose: retry any transient failure
             if attempt >= MAX_ATTEMPTS:
                 log("%s failed after %d attempts: %s" % (desc, attempt, exc))
                 raise
@@ -2402,8 +2363,7 @@ def get_key_id():
     if KEY_OCID:
         _key_id = KEY_OCID
         return _key_id
-    # The key was create-or-found by the first store_secret.sh call before this
-    # process; look it up by display name (retry to absorb list eventual consistency).
+    # Retries: a just-created key may not show up in list_keys immediately (eventual consistency).
     for _ in range(MAX_ATTEMPTS):
         try:
             keys = call("list_keys", oci.pagination.list_call_get_all_results,
@@ -2420,8 +2380,7 @@ def get_key_id():
 
 
 def content_details(value):
-    # No version name: OCI requires version names to be unique per secret, and the
-    # shell helper (store_in_vault) never set one — parity matters on recycled vaults.
+    # No version name, matching store_in_vault's shell helper (parity on recycled vaults).
     return oci.vault.models.Base64SecretContentDetails(
         content_type="BASE64",
         content=base64.b64encode(value.encode("utf-8")).decode("ascii"))
@@ -2509,9 +2468,7 @@ def main():
     for name in order:
         store(name, values[name])
 
-    # LAST, once everything else is written and verified: signal readiness with the
-    # deployment token (not a bare "true") so a recycled vault's stale flag can't be
-    # mistaken for ours. Not part of the JSON — followers read it from the vault.
+    # Written last, using the deploy token (not "true") so a stale flag isn't mistaken for ours.
     store("ALL_SECRETS_GENERATED", DEPLOY_GEN)
 
     json.dump(values, sys.stdout)
@@ -2529,8 +2486,8 @@ PYEOF
 # step, so "cloud-init done" == app healthy). Poll-only, like the GCP/DO HA
 # references: recovery is owned by systemd (openvidu.service Restart=always), so
 # NO restart logic here — an in-script restart while the HA cluster forms risks
-# the restart storm that kept the replica set from converging. Bounded to 20 min
-# (240 x 5s) so a wedged node fails cloud-init instead of hanging forever.
+# the restart storm that kept the replica set from converging.
+# Bounded to 20 min; exits non-zero if the endpoint never returns 200.
 HTTP_STATUS=""
 for i in $(seq 1 240); do
   HTTP_STATUS=$(curl -Ik http://localhost:7880/health/caddy 2>/dev/null | head -n1 | awk '{print $2}')
@@ -2643,8 +2600,7 @@ CONFIG_S3_EOF
 
   echo "DPkg::Lock::Timeout \"-1\";" > /etc/apt/apt.conf.d/99timeout
   # FIX-OR-1: bounded retry around transient apt bootstrap (flaky mirror/throttling).
-  # Idempotent; a healthy deploy succeeds on the 1st attempt. Exits non-zero (under
-  # set -e) if all 5 attempts fail so a real failure still surfaces.
+  # Idempotent; exits non-zero after 5 failed attempts (set -e surfaces it).
   for i in 1 2 3 4 5; do
     apt-get update && apt-get install -y curl jq wget ca-certificates gnupg lsb-release openssl pipx && break
     if [ "$i" = 5 ]; then echo "[user-data] apt bootstrap failed after 5 attempts" >&2; exit 1; fi
@@ -2655,8 +2611,7 @@ CONFIG_S3_EOF
   export HOME="/root"
   OCI_CLI_VERSION="3.87.0"
   # FIX-OR-1: bounded retry around transient pipx/PyPI install (throttled index).
-  # Idempotent; a healthy deploy succeeds on the 1st attempt. Exits non-zero (under
-  # set -e) if all 5 attempts fail so a real failure still surfaces.
+  # Idempotent; exits non-zero after 5 failed attempts (set -e surfaces it).
   for i in 1 2 3 4 5; do
     pipx install oci-cli==$${OCI_CLI_VERSION} && break
     if [ "$i" = 5 ]; then echo "[user-data] pipx install oci-cli failed after 5 attempts" >&2; exit 1; fi
@@ -2916,8 +2871,8 @@ get_secret() {
 
 # Wait for the master to finish writing all secrets FOR THIS deployment. Gate on
 # the deployment token (not "true") so a recycled vault's stale
-# ALL_SECRETS_GENERATED isn't mistaken for ours. Bounded to 30 min (180 x 10s) so
-# a media node fails cloud-init instead of polling forever if the masters never publish.
+# ALL_SECRETS_GENERATED isn't mistaken for ours.
+# Bounded to 30 min; exits non-zero if the masters never publish.
 SECRETS_READY=""
 for i in $(seq 1 180); do
   if [[ "$(get_secret ALL_SECRETS_GENERATED 2>/dev/null)" == "$DEPLOY_GEN" ]]; then
@@ -2942,9 +2897,7 @@ if [[ -z "$OPENVIDU_VERSION" || "$OPENVIDU_VERSION" == "none" ]]; then
   exit 1
 fi
 
-# Build install command for HA media node. Fetch to a file with retries and
-# verify it is non-empty before running: `sh <(curl ...)` silently runs an EMPTY
-# script (exit 0) if curl fails transiently, so the node would look "installed".
+# Fetch installer to a file first: `sh <(curl ...)` would silently no-op if curl failed.
 INSTALLER=/tmp/install_ov_media_node.sh
 curl -fsSL --retry 8 --retry-all-errors --retry-delay 5 \
   -o "$INSTALLER" "http://get.openvidu.io/pro/ha/$OPENVIDU_VERSION/install_ov_media_node.sh"
