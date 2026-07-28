@@ -534,9 +534,8 @@ resource "oci_core_instance" "openvidu_master_node" {
     "scale-in-fn-id" = try(oci_functions_function.scale_in_fn[0].id, "")
   }
 
-  # NSG rules + NLB resource only (NOT backends/listeners → cycle): net path ready before boot.
+  # NSG rules only; NLB is deliberately excluded — its IP is resolved at runtime, not via depends_on.
   depends_on = [
-    oci_network_load_balancer_network_load_balancer.openvidu_nlb,
     oci_core_network_security_group_security_rule.nsg_egress,
     oci_core_network_security_group_security_rule.nlb_internet_ingress,
     oci_core_network_security_group_security_rule.master_internet_ingress,
@@ -877,6 +876,8 @@ resource "oci_identity_policy" "media_node_predrain_policy" {
     "allow dynamic-group ${oci_identity_dynamic_group.openvidu_instances_dg.name} to manage secret-family in compartment id ${var.compartment_ocid}",
     "allow dynamic-group ${oci_identity_dynamic_group.openvidu_instances_dg.name} to read secret-bundles in compartment id ${var.compartment_ocid}",
     "allow dynamic-group ${oci_identity_dynamic_group.openvidu_instances_dg.name} to read metrics in compartment id ${var.compartment_ocid}",
+    # Lets master #1 read the NLB's public IP at boot when domainName is empty.
+    "allow dynamic-group ${oci_identity_dynamic_group.openvidu_instances_dg.name} to read network-load-balancers in compartment id ${var.compartment_ocid}",
     # Vault and key may be in a different compartment — use the vault's actual compartment.
     # "manage keys" (not just "use"): master #1 now create-or-finds the KMS key
     # itself at boot (see ensure_key in oci_helpers.sh), so Terraform no longer
@@ -1115,12 +1116,6 @@ resource "oci_network_load_balancer_listener" "master" {
 }
 
 locals {
-  # NLB public IP (the HA entry point), used as the domain when no domain is
-  # given. OCI returns `ip_addresses` as a list; the public one has
-  # `is_public = true`.
-  nlb_ip_address = one([for ip in oci_network_load_balancer_network_load_balancer.openvidu_nlb.ip_addresses : ip.ip_address if ip.is_public])
-  domain_name    = var.domainName != "" ? var.domainName : local.nlb_ip_address
-
   # OCI ARM (Ampere) shapes use "VM.Standard.A" / "BM.Standard.A" prefixes; all
   # others (VM.Standard.E*, VM.Standard3/2, BM.Standard2...) are x86.
   is_arm_instance = startswith(var.masterNodeShape, "VM.Standard.A") || startswith(var.masterNodeShape, "BM.Standard.A")
@@ -1704,19 +1699,12 @@ YQ_VERSION=v4.53.3
 echo "DPkg::Lock::Timeout \"-1\";" > /etc/apt/apt.conf.d/99timeout
 
 # FIX-OR-1: bounded retry around transient apt bootstrap (flaky mirror/throttling).
-# Idempotent; healthy deploy succeeds on the 1st attempt. The plain apt-get below
-# is kept as the final attempt so a real failure still surfaces under set -e.
-for i in 1 2 3 4 5; do apt-get update && apt-get install -y curl unzip jq wget ca-certificates gnupg lsb-release openssl firewalld && break || sleep $((i*15)); done
-apt-get update && apt-get install -y \
-  curl \
-  unzip \
-  jq \
-  wget \
-  ca-certificates \
-  gnupg \
-  lsb-release \
-  openssl \
-  firewalld
+# Idempotent; exits non-zero after 5 failed attempts (set -e surfaces it).
+for i in 1 2 3 4 5; do
+  apt-get update && apt-get install -y curl unzip jq wget ca-certificates gnupg lsb-release openssl firewalld && break
+  if [ "$i" = 5 ]; then echo "[install] apt bootstrap failed after 5 attempts" >&2; exit 1; fi
+  sleep $((i * 15))
+done
 
 # Apply firewall rules
 systemctl enable firewalld
@@ -1801,60 +1789,70 @@ PRIVATE_IP=$(curl -sf -H "Authorization: Bearer Oracle" http://169.254.169.254/o
 # the loop converges even if one races ahead.
 /usr/local/bin/store_secret.sh save "MASTER_NODE_$${MASTER_NODE_NUM}_PRIVATE_IP" "$DEPLOY_GEN|$PRIVATE_IP" >/dev/null
 
+# Master #1 only: poll for the NLB's public IP by display-name, bounded to 20 min.
+resolve_nlb_public_ip() {
+  local deadline ip
+  deadline=$(( $(date +%s) + 1200 ))
+  while true; do
+    ip=$(oci nlb network-load-balancer list \
+      --compartment-id "${var.compartment_ocid}" \
+      --all \
+      --auth instance_principal \
+      --output json 2>/dev/null \
+      | jq -r --arg n "${var.stackName}-nlb" \
+          '.data.items[]? | select(."display-name" == $n) | .["ip-addresses"][]? | select(.["is-public"] == true) | .["ip-address"]' 2>/dev/null \
+      | head -1)
+    if [[ -n "$ip" && "$ip" != "null" ]]; then
+      echo "$ip"
+      return 0
+    fi
+    if [[ $(date +%s) -ge $deadline ]]; then
+      echo "[ha-bootstrap] NLB '${var.stackName}-nlb' public IP not resolved after 20 min" >&2
+      return 1
+    fi
+    echo "[ha-bootstrap] waiting for NLB '${var.stackName}-nlb' public IP..." >&2
+    sleep 10
+  done
+}
+
 if [[ "$MASTER_NODE_NUM" == "1" ]]; then
   # ----- BOOTSTRAP PATH: master #1 generates the shared cluster secrets -----
   echo "[ha-bootstrap] Master #1 — generating cluster secrets."
 
   # Mark not-ready first so previous-deployment media nodes don't read stale
   # values pointing to dead masters.
+  # Also create-or-finds the KMS key on a fresh vault, before bootstrap_secrets.py runs.
   /usr/local/bin/store_secret.sh save ALL_SECRETS_GENERATED "false" >/dev/null
 
-  # Domain: var.domainName if set, else derived at Terraform time from the NLB
-  # public IP (the HA entry point).
+  # Domain: var.domainName if set, else the NLB public IP resolved at runtime.
   if [[ "${var.domainName}" == "" ]]; then
-    DOMAIN="${local.domain_name}"
+    DOMAIN="$(resolve_nlb_public_ip)" || { echo "[ha-bootstrap] could not resolve NLB public IP" >&2; exit 1; }
   else
     DOMAIN="${var.domainName}"
   fi
-  DOMAIN="$(/usr/local/bin/store_secret.sh save DOMAIN_NAME "$DOMAIN")"
 
-  # Publish the derived URL secrets early so previous-deployment media nodes and
-  # clients can read them before after_install re-writes the same values.
-  /usr/local/bin/store_secret.sh save OPENVIDU_URL "https://$DOMAIN/" >/dev/null
-  /usr/local/bin/store_secret.sh save LIVEKIT_URL "wss://$DOMAIN/" >/dev/null
-  /usr/local/bin/store_secret.sh save DASHBOARD_URL "https://$DOMAIN/dashboard/" >/dev/null
-  /usr/local/bin/store_secret.sh save GRAFANA_URL "https://$DOMAIN/grafana/" >/dev/null
-
-  # Meet initial admin user and password
-  MEET_INITIAL_ADMIN_USER="$(/usr/local/bin/store_secret.sh save MEET_INITIAL_ADMIN_USER "admin")"
-  if [[ "${var.initialMeetAdminPassword}" != '' ]]; then
-    MEET_INITIAL_ADMIN_PASSWORD="$(/usr/local/bin/store_secret.sh save MEET_INITIAL_ADMIN_PASSWORD "${var.initialMeetAdminPassword}")"
-  else
-    MEET_INITIAL_ADMIN_PASSWORD="$(/usr/local/bin/store_secret.sh generate MEET_INITIAL_ADMIN_PASSWORD)"
-  fi
+  # Generates all cluster secrets in one process and returns them as JSON.
+  SECRETS_JSON="$(/usr/local/bin/bootstrap_secrets.sh "$DOMAIN" "$DEPLOY_GEN" "$OPENVIDU_VERSION")"
+  DOMAIN="$(echo "$SECRETS_JSON" | jq -r '.DOMAIN_NAME')"
+  MEET_INITIAL_ADMIN_USER="$(echo "$SECRETS_JSON" | jq -r '.MEET_INITIAL_ADMIN_USER')"
+  MEET_INITIAL_ADMIN_PASSWORD="$(echo "$SECRETS_JSON" | jq -r '.MEET_INITIAL_ADMIN_PASSWORD')"
+  REDIS_PASSWORD="$(echo "$SECRETS_JSON" | jq -r '.REDIS_PASSWORD')"
+  MONGO_ADMIN_USERNAME="$(echo "$SECRETS_JSON" | jq -r '.MONGO_ADMIN_USERNAME')"
+  MONGO_ADMIN_PASSWORD="$(echo "$SECRETS_JSON" | jq -r '.MONGO_ADMIN_PASSWORD')"
+  MONGO_REPLICA_SET_KEY="$(echo "$SECRETS_JSON" | jq -r '.MONGO_REPLICA_SET_KEY')"
+  DASHBOARD_ADMIN_USERNAME="$(echo "$SECRETS_JSON" | jq -r '.DASHBOARD_ADMIN_USERNAME')"
+  DASHBOARD_ADMIN_PASSWORD="$(echo "$SECRETS_JSON" | jq -r '.DASHBOARD_ADMIN_PASSWORD')"
+  GRAFANA_ADMIN_USERNAME="$(echo "$SECRETS_JSON" | jq -r '.GRAFANA_ADMIN_USERNAME')"
+  GRAFANA_ADMIN_PASSWORD="$(echo "$SECRETS_JSON" | jq -r '.GRAFANA_ADMIN_PASSWORD')"
+  ENABLED_MODULES="$(echo "$SECRETS_JSON" | jq -r '.ENABLED_MODULES')"
+  LIVEKIT_API_KEY="$(echo "$SECRETS_JSON" | jq -r '.LIVEKIT_API_KEY')"
+  LIVEKIT_API_SECRET="$(echo "$SECRETS_JSON" | jq -r '.LIVEKIT_API_SECRET')"
+  OPENVIDU_PRO_LICENSE="$(echo "$SECRETS_JSON" | jq -r '.OPENVIDU_PRO_LICENSE')"
+  OPENVIDU_RTC_ENGINE="$(echo "$SECRETS_JSON" | jq -r '.OPENVIDU_RTC_ENGINE')"
+  OPENVIDU_VERSION="$(echo "$SECRETS_JSON" | jq -r '.OPENVIDU_VERSION')"
   if [[ "${var.initialMeetApiKey}" != '' ]]; then
-    MEET_INITIAL_API_KEY="$(/usr/local/bin/store_secret.sh save MEET_INITIAL_API_KEY "${var.initialMeetApiKey}")"
+    MEET_INITIAL_API_KEY="$(echo "$SECRETS_JSON" | jq -r '.MEET_INITIAL_API_KEY')"
   fi
-
-  REDIS_PASSWORD="$(/usr/local/bin/store_secret.sh generate REDIS_PASSWORD)"
-  MONGO_ADMIN_USERNAME="$(/usr/local/bin/store_secret.sh save MONGO_ADMIN_USERNAME "mongoadmin")"
-  MONGO_ADMIN_PASSWORD="$(/usr/local/bin/store_secret.sh generate MONGO_ADMIN_PASSWORD)"
-  MONGO_REPLICA_SET_KEY="$(/usr/local/bin/store_secret.sh generate MONGO_REPLICA_SET_KEY)"
-  DASHBOARD_ADMIN_USERNAME="$(/usr/local/bin/store_secret.sh save DASHBOARD_ADMIN_USERNAME "dashboardadmin")"
-  DASHBOARD_ADMIN_PASSWORD="$(/usr/local/bin/store_secret.sh generate DASHBOARD_ADMIN_PASSWORD)"
-  GRAFANA_ADMIN_USERNAME="$(/usr/local/bin/store_secret.sh save GRAFANA_ADMIN_USERNAME "grafanaadmin")"
-  GRAFANA_ADMIN_PASSWORD="$(/usr/local/bin/store_secret.sh generate GRAFANA_ADMIN_PASSWORD)"
-  ENABLED_MODULES="$(/usr/local/bin/store_secret.sh save ENABLED_MODULES "observability,openviduMeet,v2compatibility")"
-  LIVEKIT_API_KEY="$(/usr/local/bin/store_secret.sh generate LIVEKIT_API_KEY "API" 12)"
-  LIVEKIT_API_SECRET="$(/usr/local/bin/store_secret.sh generate LIVEKIT_API_SECRET)"
-
-  OPENVIDU_PRO_LICENSE="$(/usr/local/bin/store_secret.sh save OPENVIDU_PRO_LICENSE "${var.openviduLicense}")"
-  OPENVIDU_RTC_ENGINE="$(/usr/local/bin/store_secret.sh save OPENVIDU_RTC_ENGINE "${var.rtcEngine}")"
-  OPENVIDU_VERSION="$(/usr/local/bin/store_secret.sh save OPENVIDU_VERSION "$OPENVIDU_VERSION")"
-
-  # Signal readiness with the deployment token (not a bare "true") so a recycled
-  # vault's stale ALL_SECRETS_GENERATED can't be mistaken for ours.
-  /usr/local/bin/store_secret.sh save ALL_SECRETS_GENERATED "$DEPLOY_GEN" >/dev/null
   echo "[ha-bootstrap] Master #1 finished writing cluster secrets."
 
 else
@@ -1925,8 +1923,12 @@ if [[ -z "$IP1" || -z "$IP2" || -z "$IP3" || -z "$IP4" ]]; then
 fi
 MASTER_NODE_PRIVATE_IP_LIST="$IP1,$IP2,$IP3,$IP4"
 
-# Build install command for HA master node
-INSTALL_COMMAND="sh <(curl -fsSL http://get.openvidu.io/pro/ha/$OPENVIDU_VERSION/install_ov_master_node.sh)"
+# Fetch installer to a file first: `sh <(curl ...)` would silently no-op if curl failed.
+INSTALLER=/tmp/install_ov_master_node.sh
+curl -fsSL --retry 8 --retry-all-errors --retry-delay 5 \
+  -o "$INSTALLER" "http://get.openvidu.io/pro/ha/$OPENVIDU_VERSION/install_ov_master_node.sh"
+[ -s "$INSTALLER" ] || { echo "[install] downloaded master node installer is empty" >&2; exit 1; }
+INSTALL_COMMAND="sh $INSTALLER"
 
 COMMON_ARGS=(
   "--no-tty"
@@ -2232,6 +2234,252 @@ else
 fi
 EOF
 
+  # Wrapper for bootstrap_secrets.py: exports OV_* config, then execs it. Args: <domain> <deploy-gen> <version>.
+  bootstrap_secrets_wrapper_script = <<-EOF
+#!/bin/bash
+set -e
+
+export HOME="/root"
+export PATH="$PATH:$HOME/.local/bin"
+
+export OV_VAULT_ID="${local.vault_id}"
+export OV_KEY_OCID="${var.key_ocid}"
+export OV_KEY_COMPARTMENT_ID="${data.oci_kms_vault.openvidu_vault.compartment_id}"
+export OV_MANAGEMENT_ENDPOINT="${data.oci_kms_vault.openvidu_vault.management_endpoint}"
+export OV_KEY_DISPLAY_NAME="${var.stackName}-key"
+export OV_COMPARTMENT_ID="${var.compartment_ocid}"
+
+export OV_OPENVIDU_LICENSE="${var.openviduLicense}"
+export OV_RTC_ENGINE="${var.rtcEngine}"
+export OV_INITIAL_MEET_ADMIN_PASSWORD="${var.initialMeetAdminPassword}"
+export OV_INITIAL_MEET_API_KEY="${var.initialMeetApiKey}"
+
+export OV_DOMAIN="$1"
+export OV_DEPLOY_GEN="$2"
+export OV_OPENVIDU_VERSION="$3"
+
+# Must run with the oci-cli venv's Python (has the oci SDK), resolved via its shebang.
+OCI_PY=$(head -1 "$(command -v oci)" | cut -c3-)
+exec "$OCI_PY" /usr/local/bin/bootstrap_secrets.py
+EOF
+
+  # Terraform-interpolated heredoc: escape a literal $ as $$ (no bare ${...} below).
+  bootstrap_secrets_py = <<-PYEOF
+#!/usr/bin/env python3
+"""Generates all HA cluster secrets in one process (master #1 only). Writes them to
+the vault (ALL_SECRETS_GENERATED last) and prints them as JSON on stdout; logs to stderr.
+"""
+import base64
+import json
+import os
+import secrets
+import string
+import sys
+import time
+
+import oci
+import oci.auth.signers
+import oci.key_management
+import oci.pagination
+import oci.secrets
+import oci.vault
+
+VAULT_ID = os.environ["OV_VAULT_ID"]
+KEY_OCID = os.environ.get("OV_KEY_OCID", "")
+KEY_COMPARTMENT_ID = os.environ["OV_KEY_COMPARTMENT_ID"]
+MANAGEMENT_ENDPOINT = os.environ["OV_MANAGEMENT_ENDPOINT"]
+KEY_DISPLAY_NAME = os.environ["OV_KEY_DISPLAY_NAME"]
+COMPARTMENT_ID = os.environ["OV_COMPARTMENT_ID"]
+DOMAIN = os.environ["OV_DOMAIN"]
+DEPLOY_GEN = os.environ["OV_DEPLOY_GEN"]
+OPENVIDU_VERSION = os.environ.get("OV_OPENVIDU_VERSION", "main")
+OPENVIDU_LICENSE = os.environ.get("OV_OPENVIDU_LICENSE", "")
+RTC_ENGINE = os.environ.get("OV_RTC_ENGINE", "")
+INITIAL_MEET_ADMIN_PASSWORD = os.environ.get("OV_INITIAL_MEET_ADMIN_PASSWORD", "")
+INITIAL_MEET_API_KEY = os.environ.get("OV_INITIAL_MEET_API_KEY", "")
+VAULT_SETTLE_SECONDS = int(os.environ.get("VAULT_SETTLE_SECONDS", "30"))
+
+MAX_ATTEMPTS = 6
+
+
+def log(msg):
+    print("[bootstrap_secrets] " + msg, file=sys.stderr, flush=True)
+
+
+signer = oci.auth.signers.InstancePrincipalsSecurityTokenSigner()
+vaults_client = oci.vault.VaultsClient(config={}, signer=signer, timeout=(10, 45))
+secrets_client = oci.secrets.SecretsClient(config={}, signer=signer, timeout=(10, 45))
+kms_client = oci.key_management.KmsManagementClient(
+    config={}, signer=signer, service_endpoint=MANAGEMENT_ENDPOINT, timeout=(10, 45)
+)
+
+_key_id = None
+
+
+def rand_token(length, prefix=""):
+    # Same alphabet as store_secret.sh's 'generate' ([A-Za-z0-9]), for parity.
+    alphabet = string.ascii_letters + string.digits
+    return prefix + "".join(secrets.choice(alphabet) for _ in range(length))
+
+
+def call(desc, func, *args, **kwargs):
+    delay = 5
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            return func(*args, **kwargs)
+        except Exception as exc:  # broad on purpose: retry any transient failure
+            if attempt >= MAX_ATTEMPTS:
+                log("%s failed after %d attempts: %s" % (desc, attempt, exc))
+                raise
+            log("%s failed (attempt %d/%d): %s; retrying in %ds"
+                % (desc, attempt, MAX_ATTEMPTS, exc, delay))
+            time.sleep(delay)
+            delay *= 2
+
+
+def find_secret_id(name, state):
+    resp = call("list_secrets(" + name + ")",
+                oci.pagination.list_call_get_all_results,
+                vaults_client.list_secrets, COMPARTMENT_ID, vault_id=VAULT_ID, name=name)
+    for summary in resp.data:
+        if summary.secret_name == name and summary.lifecycle_state == state:
+            return summary.id
+    return None
+
+
+def read_current(secret_id):
+    try:
+        bundle = call("get_secret_bundle", secrets_client.get_secret_bundle, secret_id)
+        return base64.b64decode(bundle.data.secret_bundle_content.content).decode("utf-8")
+    except Exception as exc:
+        log("could not read current value of %s: %s" % (secret_id, exc))
+        return None
+
+
+def get_key_id():
+    global _key_id
+    if _key_id:
+        return _key_id
+    if KEY_OCID:
+        _key_id = KEY_OCID
+        return _key_id
+    # Retries: a just-created key may not show up in list_keys immediately (eventual consistency).
+    for _ in range(MAX_ATTEMPTS):
+        try:
+            keys = call("list_keys", oci.pagination.list_call_get_all_results,
+                        kms_client.list_keys, KEY_COMPARTMENT_ID).data
+            for key in keys:
+                if key.display_name == KEY_DISPLAY_NAME and key.lifecycle_state == "ENABLED":
+                    _key_id = key.id
+                    return _key_id
+        except Exception as exc:
+            log("list_keys failed: %s" % exc)
+        time.sleep(5)
+    raise RuntimeError("KMS key '%s' not found (should have been created by store_secret.sh)"
+                       % KEY_DISPLAY_NAME)
+
+
+def content_details(value):
+    # No version name, matching store_in_vault's shell helper (parity on recycled vaults).
+    return oci.vault.models.Base64SecretContentDetails(
+        content_type="BASE64",
+        content=base64.b64encode(value.encode("utf-8")).decode("ascii"))
+
+
+def store(name, value):
+    active_id = find_secret_id(name, "ACTIVE")
+    if active_id:
+        if read_current(active_id) == value:
+            log("%s: unchanged, skipping" % name)
+            return
+        call("update_secret(%s)" % name, vaults_client.update_secret, active_id,
+             oci.vault.models.UpdateSecretDetails(secret_content=content_details(value)))
+        log("%s: updated" % name)
+        return
+
+    pending_id = find_secret_id(name, "PENDING_DELETION")
+    if pending_id:
+        call("cancel_secret_deletion(%s)" % name,
+             vaults_client.cancel_secret_deletion, pending_id)
+        state = ""
+        for _ in range(40):
+            try:
+                state = call("get_secret(%s)" % name,
+                             vaults_client.get_secret, pending_id).data.lifecycle_state
+            except Exception:
+                state = ""
+            if state == "ACTIVE":
+                break
+            time.sleep(3)
+        if state != "ACTIVE":
+            raise RuntimeError("%s still %s after cancel-deletion wait" % (name, state))
+        # ACTIVE on the API != immediately writable; let the data plane settle.
+        time.sleep(VAULT_SETTLE_SECONDS)
+        call("update_secret(%s)" % name, vaults_client.update_secret, pending_id,
+             oci.vault.models.UpdateSecretDetails(secret_content=content_details(value)))
+        log("%s: recovered from PENDING_DELETION and updated" % name)
+        return
+
+    call("create_secret(%s)" % name, vaults_client.create_secret,
+         oci.vault.models.CreateSecretDetails(
+             compartment_id=COMPARTMENT_ID, secret_name=name, vault_id=VAULT_ID,
+             key_id=get_key_id(), secret_content=content_details(value)))
+    log("%s: created" % name)
+
+
+def main():
+    values = {
+        "DOMAIN_NAME": DOMAIN,
+        "OPENVIDU_URL": "https://" + DOMAIN + "/",
+        "LIVEKIT_URL": "wss://" + DOMAIN + "/",
+        "DASHBOARD_URL": "https://" + DOMAIN + "/dashboard/",
+        "GRAFANA_URL": "https://" + DOMAIN + "/grafana/",
+        "MEET_INITIAL_ADMIN_USER": "admin",
+        "MEET_INITIAL_ADMIN_PASSWORD": INITIAL_MEET_ADMIN_PASSWORD or rand_token(44),
+        "REDIS_PASSWORD": rand_token(44),
+        "MONGO_ADMIN_USERNAME": "mongoadmin",
+        "MONGO_ADMIN_PASSWORD": rand_token(44),
+        "MONGO_REPLICA_SET_KEY": rand_token(44),
+        "DASHBOARD_ADMIN_USERNAME": "dashboardadmin",
+        "DASHBOARD_ADMIN_PASSWORD": rand_token(44),
+        "GRAFANA_ADMIN_USERNAME": "grafanaadmin",
+        "GRAFANA_ADMIN_PASSWORD": rand_token(44),
+        "ENABLED_MODULES": "observability,openviduMeet,v2compatibility",
+        "LIVEKIT_API_KEY": rand_token(12, "API"),
+        "LIVEKIT_API_SECRET": rand_token(44),
+        "OPENVIDU_PRO_LICENSE": OPENVIDU_LICENSE,
+        "OPENVIDU_RTC_ENGINE": RTC_ENGINE,
+        "OPENVIDU_VERSION": OPENVIDU_VERSION,
+    }
+    order = [
+        "DOMAIN_NAME", "OPENVIDU_URL", "LIVEKIT_URL", "DASHBOARD_URL", "GRAFANA_URL",
+        "MEET_INITIAL_ADMIN_USER", "MEET_INITIAL_ADMIN_PASSWORD", "REDIS_PASSWORD",
+        "MONGO_ADMIN_USERNAME", "MONGO_ADMIN_PASSWORD", "MONGO_REPLICA_SET_KEY",
+        "DASHBOARD_ADMIN_USERNAME", "DASHBOARD_ADMIN_PASSWORD", "GRAFANA_ADMIN_USERNAME",
+        "GRAFANA_ADMIN_PASSWORD", "ENABLED_MODULES", "LIVEKIT_API_KEY",
+        "LIVEKIT_API_SECRET", "OPENVIDU_PRO_LICENSE", "OPENVIDU_RTC_ENGINE",
+        "OPENVIDU_VERSION",
+    ]
+    # Only set the Meet API key when provided (empty would null the installer default).
+    if INITIAL_MEET_API_KEY:
+        values["MEET_INITIAL_API_KEY"] = INITIAL_MEET_API_KEY
+        order.append("MEET_INITIAL_API_KEY")
+
+    for name in order:
+        store(name, values[name])
+
+    # Written last, using the deploy token (not "true") so a stale flag isn't mistaken for ours.
+    store("ALL_SECRETS_GENERATED", DEPLOY_GEN)
+
+    json.dump(values, sys.stdout)
+    sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+PYEOF
+
   check_app_ready_script = <<-EOF
 #!/bin/bash
 # Poll OpenVidu's health endpoint until 200, then exit (final blocking cloud-init
@@ -2239,13 +2487,19 @@ EOF
 # references: recovery is owned by systemd (openvidu.service Restart=always), so
 # NO restart logic here — an in-script restart while the HA cluster forms risks
 # the restart storm that kept the replica set from converging.
-while true; do
+# Bounded to 20 min; exits non-zero if the endpoint never returns 200.
+HTTP_STATUS=""
+for i in $(seq 1 240); do
   HTTP_STATUS=$(curl -Ik http://localhost:7880/health/caddy 2>/dev/null | head -n1 | awk '{print $2}')
   if [ "$HTTP_STATUS" == "200" ]; then
     break
   fi
   sleep 5
 done
+if [ "$HTTP_STATUS" != "200" ]; then
+  echo "[check_app_ready] OpenVidu health endpoint not ready after 20 min" >&2
+  exit 1
+fi
 EOF
 
   restart_script = <<-EOF
@@ -2321,6 +2575,17 @@ ${local.store_secret_script}
 STORE_SECRET_EOF
   chmod +x /usr/local/bin/store_secret.sh
 
+  # bootstrap_secrets.py + wrapper — master #1's consolidated secret generator.
+  cat > /usr/local/bin/bootstrap_secrets.py << 'BOOTSTRAP_PY_EOF'
+${local.bootstrap_secrets_py}
+BOOTSTRAP_PY_EOF
+  chmod +x /usr/local/bin/bootstrap_secrets.py
+
+  cat > /usr/local/bin/bootstrap_secrets.sh << 'BOOTSTRAP_WRAPPER_EOF'
+${local.bootstrap_secrets_wrapper_script}
+BOOTSTRAP_WRAPPER_EOF
+  chmod +x /usr/local/bin/bootstrap_secrets.sh
+
   # check_app_ready.sh
   cat > /usr/local/bin/check_app_ready.sh << 'CHECK_APP_EOF'
 ${local.check_app_ready_script}
@@ -2335,27 +2600,23 @@ CONFIG_S3_EOF
 
   echo "DPkg::Lock::Timeout \"-1\";" > /etc/apt/apt.conf.d/99timeout
   # FIX-OR-1: bounded retry around transient apt bootstrap (flaky mirror/throttling).
-  # Idempotent; healthy deploy succeeds on the 1st attempt. The plain apt-get below
-  # is kept as the final attempt so a real failure still surfaces under set -e.
-  for i in 1 2 3 4 5; do apt-get update && apt-get install -y curl jq wget ca-certificates gnupg lsb-release openssl pipx && break || sleep $((i*15)); done
-  apt-get update && apt-get install -y \
-    curl \
-    jq \
-    wget \
-    ca-certificates \
-    gnupg \
-    lsb-release \
-    openssl \
-    pipx
+  # Idempotent; exits non-zero after 5 failed attempts (set -e surfaces it).
+  for i in 1 2 3 4 5; do
+    apt-get update && apt-get install -y curl jq wget ca-certificates gnupg lsb-release openssl pipx && break
+    if [ "$i" = 5 ]; then echo "[user-data] apt bootstrap failed after 5 attempts" >&2; exit 1; fi
+    sleep $((i * 15))
+  done
 
   # Install OCI CLI via pipx (correct method on modern Ubuntu)
   export HOME="/root"
   OCI_CLI_VERSION="3.87.0"
   # FIX-OR-1: bounded retry around transient pipx/PyPI install (throttled index).
-  # Idempotent; healthy deploy succeeds on the 1st attempt. The plain pipx below
-  # is kept as the final attempt so a real failure still surfaces under set -e.
-  for i in 1 2 3 4 5; do pipx install oci-cli==$${OCI_CLI_VERSION} && break || sleep $((i*15)); done
-  pipx install oci-cli==$${OCI_CLI_VERSION}
+  # Idempotent; exits non-zero after 5 failed attempts (set -e surfaces it).
+  for i in 1 2 3 4 5; do
+    pipx install oci-cli==$${OCI_CLI_VERSION} && break
+    if [ "$i" = 5 ]; then echo "[user-data] pipx install oci-cli failed after 5 attempts" >&2; exit 1; fi
+    sleep $((i * 15))
+  done
   export PATH="$PATH:$HOME/.local/bin"
 
   # Install OpenVidu
@@ -2611,10 +2872,20 @@ get_secret() {
 # Wait for the master to finish writing all secrets FOR THIS deployment. Gate on
 # the deployment token (not "true") so a recycled vault's stale
 # ALL_SECRETS_GENERATED isn't mistaken for ours.
-until [[ "$(get_secret ALL_SECRETS_GENERATED 2>/dev/null)" == "$DEPLOY_GEN" ]]; do
+# Bounded to 30 min; exits non-zero if the masters never publish.
+SECRETS_READY=""
+for i in $(seq 1 180); do
+  if [[ "$(get_secret ALL_SECRETS_GENERATED 2>/dev/null)" == "$DEPLOY_GEN" ]]; then
+    SECRETS_READY=1
+    break
+  fi
   echo "Waiting for master node to initialize secrets (generation $DEPLOY_GEN)..."
   sleep 10
 done
+if [[ -z "$SECRETS_READY" ]]; then
+  echo "Timeout waiting for ALL_SECRETS_GENERATED=$DEPLOY_GEN after 30 min" >&2
+  exit 1
+fi
 
 DOMAIN=$(get_secret DOMAIN_NAME)
 OPENVIDU_PRO_LICENSE=$(get_secret OPENVIDU_PRO_LICENSE)
@@ -2626,8 +2897,12 @@ if [[ -z "$OPENVIDU_VERSION" || "$OPENVIDU_VERSION" == "none" ]]; then
   exit 1
 fi
 
-# Build install command for HA media node
-INSTALL_COMMAND="sh <(curl -fsSL http://get.openvidu.io/pro/ha/$OPENVIDU_VERSION/install_ov_media_node.sh)"
+# Fetch installer to a file first: `sh <(curl ...)` would silently no-op if curl failed.
+INSTALLER=/tmp/install_ov_media_node.sh
+curl -fsSL --retry 8 --retry-all-errors --retry-delay 5 \
+  -o "$INSTALLER" "http://get.openvidu.io/pro/ha/$OPENVIDU_VERSION/install_ov_media_node.sh"
+[ -s "$INSTALLER" ] || { echo "[install] downloaded media node installer is empty" >&2; exit 1; }
+INSTALL_COMMAND="sh $INSTALLER"
 
 COMMON_ARGS=(
   "--no-tty"

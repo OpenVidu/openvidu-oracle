@@ -5,6 +5,8 @@
 *.tfstate.lock.info
 *.tfvars
 *.sh
+# Keep the scale-in image build helper tracked (needed to build/push the image).
+!pro/scalein-function/build-and-push.sh
 .dockerignore
 
 # Python
