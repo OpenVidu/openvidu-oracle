@@ -1403,9 +1403,6 @@ firewall-cmd --permanent --add-port=443/tcp
 firewall-cmd --add-port=1935/tcp
 firewall-cmd --permanent --add-port=1935/tcp
 
-firewall-cmd --add-port=9000/tcp
-firewall-cmd --permanent --add-port=9000/tcp
-
 ## Apply rules
 firewall-cmd --reload
 firewall-cmd --runtime-to-permanent
