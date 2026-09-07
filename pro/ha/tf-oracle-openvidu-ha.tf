@@ -1120,7 +1120,7 @@ locals {
   # others (VM.Standard.E*, VM.Standard3/2, BM.Standard2...) are x86.
   is_arm_instance = startswith(var.masterNodeShape, "VM.Standard.A") || startswith(var.masterNodeShape, "BM.Standard.A")
   yq_arch         = local.is_arm_instance ? "arm64" : "amd64"
-  yq_sha256       = local.is_arm_instance ? "42600522e7455282e11c71c9fc62dc8e98b05bcdb830210fe16eb673a871e866" : "b4077cab0f9ee5ce8381e602d090daa69a0afb7e57eb9a5b20e9cb416d7f6794"
+  yq_sha256       = local.is_arm_instance ? "d5e7531273d45c5d4b7abb4a1597c47a0fecb5d6b081dfa755064b38ffcc34f4" : "38b907b21b1b04327fb9481c595331d925a67c6ee1aabd0ef419d0b7d12dfb3d"
 
   # Common OCI Vault helpers (single source of truth for retry, query
   # sanitization, and vault read/write), sourced by store_secret /
@@ -1695,7 +1695,7 @@ set -e
 
 OPENVIDU_VERSION=main
 DOMAIN=
-YQ_VERSION=v4.53.3
+YQ_VERSION=v4.53.6
 echo "DPkg::Lock::Timeout \"-1\";" > /etc/apt/apt.conf.d/99timeout
 
 # FIX-OR-1: bounded retry around transient apt bootstrap (flaky mirror/throttling).
@@ -2606,7 +2606,7 @@ CONFIG_S3_EOF
 
   # Install OCI CLI via pipx (correct method on modern Ubuntu)
   export HOME="/root"
-  OCI_CLI_VERSION="3.87.0"
+  OCI_CLI_VERSION="3.92.0"
   # FIX-OR-1: bounded retry around transient pipx/PyPI install (throttled index).
   # Idempotent; exits non-zero after 5 failed attempts (set -e surfaces it).
   for i in 1 2 3 4 5; do
@@ -2933,7 +2933,7 @@ apt-get update && apt-get install -y \
 
 # Install OCI CLI via pipx — required by install script and pre-drain daemon
 export HOME="/root"
-OCI_CLI_VERSION="3.87.0"
+OCI_CLI_VERSION="3.92.0"
 pipx install oci-cli==$${OCI_CLI_VERSION}
 export PATH="$PATH:$HOME/.local/bin"
 
