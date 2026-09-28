@@ -1910,7 +1910,30 @@ def content_details(value):
         content=base64.b64encode(value.encode("utf-8")).decode("ascii"))
 
 
-def store(name, value):
+# States a secret passes through on its way to ACTIVE or PENDING_DELETION. The shell pre-stamp
+# of ALL_SECRETS_GENERATED right before this script runs leaves that secret UPDATING for a few
+# seconds on a recycled vault, and store() reaches it within that window.
+TRANSITIONAL_STATES = ("CREATING", "UPDATING", "SCHEDULING_DELETION", "CANCELLING_DELETION")
+
+
+def wait_until_settled(name):
+    """True if the secret was in a transitional state (and has left it), False if it never was."""
+    waited = False
+    for _ in range(40):
+        resp = call("list_secrets(" + name + ")",
+                    oci.pagination.list_call_get_all_results,
+                    vaults_client.list_secrets, COMPARTMENT_ID, vault_id=VAULT_ID, name=name)
+        busy = [s.lifecycle_state for s in resp.data
+                if s.secret_name == name and s.lifecycle_state in TRANSITIONAL_STATES]
+        if not busy:
+            return waited
+        log("%s: %s, waiting for it to settle" % (name, busy[0]))
+        waited = True
+        time.sleep(3)
+    raise RuntimeError("%s still in a transitional state after 120s" % name)
+
+
+def store(name, value, _settled=True):
     active_id = find_secret_id(name, "ACTIVE")
     if active_id:
         if read_current(active_id) == value:
@@ -1944,6 +1967,11 @@ def store(name, value):
         log("%s: recovered from PENDING_DELETION and updated" % name)
         return
 
+    # Neither ACTIVE nor PENDING_DELETION does not mean absent: a secret that is CREATING,
+    # UPDATING or moving in/out of deletion EXISTS, and create_secret on its name fails with
+    # 'name already exists' however often it is retried. Wait for it to settle and look again.
+    if _settled and wait_until_settled(name):
+        return store(name, value, _settled=False)
     call("create_secret(%s)" % name, vaults_client.create_secret,
          oci.vault.models.CreateSecretDetails(
              compartment_id=COMPARTMENT_ID, secret_name=name, vault_id=VAULT_ID,
