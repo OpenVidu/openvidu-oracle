@@ -1693,7 +1693,7 @@ EOF
 #!/bin/bash -x
 set -e
 
-OPENVIDU_VERSION=main
+OPENVIDU_VERSION=3.9.0
 DOMAIN=
 YQ_VERSION=v4.53.6
 echo "DPkg::Lock::Timeout \"-1\";" > /etc/apt/apt.conf.d/99timeout
