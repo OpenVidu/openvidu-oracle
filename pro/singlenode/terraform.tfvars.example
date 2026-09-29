@@ -87,10 +87,10 @@ openviduLicense = "your-openvidu-pro-license-key"
 
 # --- Media Engine ---
 
-# RTC engine to use. Default: "pion".
+# RTC engine to use. Default: "mediasoup".
 # Options: "pion" or "mediasoup".
 # Leave commented to use the default.
-# RTCEngine = "pion"
+# RTCEngine = "mediasoup"
 
 
 # --- Storage (OCI Object Storage) ---

@@ -149,10 +149,10 @@ scale_in_function_image = "<region-key>.ocir.io/<your-tenancy-namespace>/openvid
 
 # --- Media Engine ---
 
-# RTC engine to use. Default: "pion".
+# RTC engine to use. Default: "mediasoup".
 # Options: "pion" or "mediasoup".
 # Leave commented to use the default.
-# rtcEngine = "pion"
+# rtcEngine = "mediasoup"
 
 
 # --- Storage (OCI Object Storage) ---
