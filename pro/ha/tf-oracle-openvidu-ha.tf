@@ -1775,11 +1775,11 @@ EOF
 #   caught by the tenancy deny on a direct instance-principal terminate, and the
 #   pool relaunches a replacement to keep its size.
 # Fixed mode (no Function), or if the Function did not remove us: detach from the
-#   pool with is-decrement-size=false (the pool provisions a replacement) and
-#   is-auto-terminate=true (the pool deletes us). If the tenancy deny also blocks
-#   the pool-service terminate we stay RUNNING after the detach, so we terminate
-#   directly and, as a last resort, power off (a detached+stopped node is never
-#   restarted; the destroy-time sweep deletes it).
+#   pool with is-decrement-size=false (the pool provisions a replacement), then
+#   terminate ourselves and, as a last resort, power off (a detached+stopped node is
+#   never restarted; the destroy-time sweep deletes it). is-auto-terminate stays
+#   false: the pool runs that terminate as this instance, so a tenancy deny on it
+#   fails the whole detach and the node stays in the pool (seen live).
 
 export HOME="/root"
 export PATH="$PATH:/root/.local/bin"
@@ -1861,7 +1861,7 @@ for attempt in 1 2 3 4 5; do
         --instance-pool-id "$POOL_ID" \
         --instance-id "$SELF" \
         --is-decrement-size false \
-        --is-auto-terminate true \
+        --is-auto-terminate false \
         --auth instance_principal 2>/dev/null; then
         DETACHED=1
         break
@@ -1873,15 +1873,24 @@ if [ -z "$DETACHED" ]; then
     exit 1
 fi
 
-# is-auto-terminate should delete us; confirm (the tenancy deny may block it).
-if confirm_terminating; then
-    log "termination confirmed"
-    exit 0
+# Wait until the pool has actually let us go (the detach is asynchronous): a node
+# still in the pool would be restarted after a poweroff instead of replaced.
+GONE=""
+for _ in $(seq 1 30); do
+    IN_POOL=$(oci compute-management instance-pool list-instances \
+        --compartment-id "$COMPARTMENT_ID" --instance-pool-id "$POOL_ID" \
+        --auth instance_principal --all --output json 2>/dev/null \
+        | jq -r --arg id "$SELF" '[.data[] | select(.id == $id)] | length' 2>/dev/null)
+    [ "$IN_POOL" = "0" ] && { GONE=1; break; }
+    sleep 10
+done
+if [ -z "$GONE" ]; then
+    log "still a pool member 5 min after the detach; retrying next cycle"
+    exit 1
 fi
 
-# Detached but still RUNNING: the pool-service terminate was denied. We are out of
-# the pool now, so a direct terminate (or poweroff) will not be undone.
-log "detached but still RUNNING; terminating directly"
+# Out of the pool (a replacement is being provisioned): terminate ourselves.
+log "detached from the pool; terminating directly"
 for attempt in 1 2 3 4 5; do
     oci compute instance terminate --instance-id "$SELF" --force \
         --auth instance_principal 2>/dev/null && break
