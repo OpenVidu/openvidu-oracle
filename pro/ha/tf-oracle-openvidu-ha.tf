@@ -112,7 +112,7 @@ locals {
     ssh   = { min = 22, max = 22, label = "SSH" }
     http  = { min = 80, max = 80, label = "HTTP" }
     https = { min = 443, max = 443, label = "HTTPS" }
-    rtmp  = { min = 1935, max = 1935, label = "RTMP" }
+    rtmp  = { min = 1945, max = 1945, label = "RTMPS" }
   }
 
   media_internet_ingress_tcp = {
@@ -158,7 +158,7 @@ locals {
   nlb_ingress_tcp = {
     http  = { min = 80, max = 80, label = "HTTP" }
     https = { min = 443, max = 443, label = "HTTPS" }
-    rtmp  = { min = 1935, max = 1935, label = "RTMP" }
+    rtmp  = { min = 1945, max = 1945, label = "RTMPS" }
   }
 }
 
@@ -993,14 +993,14 @@ resource "oci_logging_log" "scale_in_fn_log" {
 # OCI NLB (layer-4 TCP passthrough) in front of the 4 masters. Listeners:
 #   - TCP 443  -> backends 443  (HTTPS/WSS, terminated by Caddy on each master)
 #   - TCP 80   -> backends 80   (HTTP, Let's Encrypt + redirect to HTTPS)
-#   - TCP 1935 -> backends 1935 (RTMP ingress)
+#   - TCP 1945 -> backends 1945 (RTMPS ingress: the port OpenVidu advertises behind a load balancer)
 # Health check is TCP 7880 (LiveKit /health/caddy, internal-only). Backend policy
 # FIVE_TUPLE for connection consistency. Media UDP does NOT traverse this NLB —
 # clients hit media nodes directly on UDP ports.
 
 # NSG for the NLB's own VNIC. Without it the NLB inherits only the subnet SL
 # (VCN-only ingress) and silently drops all inbound internet traffic on
-# 80/443/1935 — unreachable from outside, and Let's Encrypt can't reach Caddy for
+# 80/443/1945 — unreachable from outside, and Let's Encrypt can't reach Caddy for
 # the ACME challenge ("Timeout during connect"). OCI UNIONs SLs and NSGs, so this
 # only ADDS public ingress; intra-VCN traffic (health checks, backend forwarding)
 # still works via the SL. Master/media VNICs have their own NSGs; the NLB needed
@@ -1058,8 +1058,8 @@ resource "oci_network_load_balancer_network_load_balancer" "openvidu_nlb" {
 locals {
   # Master-terminated ports reachable through the NLB. The NLB does dest-NAT to
   # the BACKEND port, so each listener needs its OWN same-port backend set — a
-  # shared 443 backend set would wrongly forward 80 and 1935 to 443.
-  nlb_ports = [80, 443, 1935]
+  # shared 443 backend set would wrongly forward 80 and 1945 to 443.
+  nlb_ports = [80, 443, 1945]
 
   master_private_ips = {
     for key in ["1", "2", "3", "4"] :
@@ -1074,7 +1074,7 @@ locals {
 }
 
 # One backend set per exposed port. Health check is the masters' LiveKit/Caddy
-# endpoint on TCP 7880 — healthy there means it's serving 80/443/1935.
+# endpoint on TCP 7880 — healthy there means it's serving 80/443/1945.
 resource "oci_network_load_balancer_backend_set" "master" {
   for_each = toset([for p in local.nlb_ports : tostring(p)])
 
@@ -1104,7 +1104,7 @@ resource "oci_network_load_balancer_backend" "master" {
 }
 
 # Listeners forward each port to the same-port backend set: 80 (HTTP/ACME +
-# redirect), 443 (HTTPS/WSS via Caddy), 1935 (RTMP ingress).
+# redirect), 443 (HTTPS/WSS via Caddy), 1945 (RTMPS ingress).
 resource "oci_network_load_balancer_listener" "master" {
   for_each = toset([for p in local.nlb_ports : tostring(p)])
 
@@ -2067,8 +2067,8 @@ firewall-cmd --permanent --add-port=80/tcp
 firewall-cmd --add-port=443/tcp
 firewall-cmd --permanent --add-port=443/tcp
 
-firewall-cmd --add-port=1935/tcp
-firewall-cmd --permanent --add-port=1935/tcp
+firewall-cmd --add-port=1945/tcp
+firewall-cmd --permanent --add-port=1945/tcp
 
 firewall-cmd --add-port=7880/tcp
 firewall-cmd --permanent --add-port=7880/tcp
