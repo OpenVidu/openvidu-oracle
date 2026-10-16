@@ -1805,6 +1805,9 @@ echo "$(date -u +%FT%TZ) $1" >> "$STATE_DIR/replace-requests.log"
 # short-circuit any later graceful_shutdown.sh (it exits at once when this exists).
 touch /run/openvidu-unhealthy
 touch /var/run/openvidu-drain.lock
+# Both are withdrawn if the request fails before OCI accepts it: the node then
+# stays in the pool, and if it recovers a later scale-in must still drain it
+trap '[ $? -eq 0 ] || rm -f /run/openvidu-unhealthy /var/run/openvidu-drain.lock' EXIT
 
 log() { echo "[media-replace] $*"; }
 
@@ -1885,6 +1888,8 @@ if [ -z "$DETACHED" ]; then
     log "detach request not accepted; retrying next cycle"
     exit 1
 fi
+# The pool accepted the detach: this node is leaving it, so the markers stay
+trap - EXIT
 
 # Wait until the pool has actually let us go (the detach is asynchronous): a node
 # still in the pool would be restarted after a poweroff instead of replaced.
