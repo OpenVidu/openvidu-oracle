@@ -2275,7 +2275,7 @@ MASTER_NODE_PRIVATE_IP_LIST="$IP1,$IP2,$IP3,$IP4"
 # Fetch installer to a file first: `sh <(curl ...)` would silently no-op if curl failed.
 INSTALLER=/tmp/install_ov_master_node.sh
 curl -fsSL --retry 8 --retry-all-errors --retry-delay 5 \
-  -o "$INSTALLER" "http://get.openvidu.io/pro/ha/$OPENVIDU_VERSION/install_ov_master_node.sh"
+  -o "$INSTALLER" "https://get.openvidu.io/pro/ha/$OPENVIDU_VERSION/install_ov_master_node.sh"
 [ -s "$INSTALLER" ] || { echo "[install] downloaded master node installer is empty" >&2; exit 1; }
 INSTALL_COMMAND="sh $INSTALLER"
 
@@ -3277,7 +3277,7 @@ fi
 # Fetch installer to a file first: `sh <(curl ...)` would silently no-op if curl failed.
 INSTALLER=/tmp/install_ov_media_node.sh
 curl -fsSL --retry 8 --retry-all-errors --retry-delay 5 \
-  -o "$INSTALLER" "http://get.openvidu.io/pro/ha/$OPENVIDU_VERSION/install_ov_media_node.sh"
+  -o "$INSTALLER" "https://get.openvidu.io/pro/ha/$OPENVIDU_VERSION/install_ov_media_node.sh"
 [ -s "$INSTALLER" ] || { echo "[install] downloaded media node installer is empty" >&2; exit 1; }
 INSTALL_COMMAND="sh $INSTALLER"
 
