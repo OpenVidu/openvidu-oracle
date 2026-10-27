@@ -418,8 +418,9 @@ resource "oci_core_instance" "openvidu_server" {
   }
 
   source_details {
-    source_type = "image"
-    source_id   = local.image_id
+    source_type             = "image"
+    source_id               = local.image_id
+    boot_volume_size_in_gbs = 200
   }
 
   create_vnic_details {
@@ -437,6 +438,12 @@ resource "oci_core_instance" "openvidu_server" {
   freeform_tags = {
     "stack"    = var.stackName
     "openvidu" = "true"
+  }
+
+  # The boot volume size applies to new deployments only: a re-apply keeps the volume this
+  # instance was created with.
+  lifecycle {
+    ignore_changes = [source_details[0].boot_volume_size_in_gbs]
   }
 }
 

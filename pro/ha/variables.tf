@@ -112,7 +112,7 @@ variable "masterNodeMemory" {
 variable "masterNodeDiskSize" {
   description = "Boot disk size in GB for Master Nodes."
   type        = number
-  default     = 100
+  default     = 200
 }
 
 variable "mediaNodeShape" {
