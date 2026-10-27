@@ -429,6 +429,11 @@ data "oci_core_images" "ubuntu" {
   sort_order               = "DESC"
 }
 
+# rtcEngine replaced RTCEngine; the deprecated name still wins when it is set.
+locals {
+  rtc_engine = var.RTCEngine != "" ? var.RTCEngine : var.rtcEngine
+}
+
 resource "oci_core_instance" "openvidu_server" {
   availability_domain = data.oci_identity_availability_domain.ad.name
   compartment_id      = var.compartment_ocid
@@ -834,7 +839,7 @@ if [[ "${var.initialMeetApiKey}" != '' ]]; then
 fi
 
 OPENVIDU_PRO_LICENSE="$(/usr/local/bin/store_secret.sh save OPENVIDU_PRO_LICENSE "${var.openviduLicense}")"
-OPENVIDU_RTC_ENGINE="$(/usr/local/bin/store_secret.sh save OPENVIDU_RTC_ENGINE "${var.RTCEngine}")"
+OPENVIDU_RTC_ENGINE="$(/usr/local/bin/store_secret.sh save OPENVIDU_RTC_ENGINE "${local.rtc_engine}")"
 
 # Store usernames and generate random passwords
 REDIS_PASSWORD="$(/usr/local/bin/store_secret.sh generate REDIS_PASSWORD)"
