@@ -95,13 +95,13 @@ variable "instanceType" {
 variable "instanceOCPUs" {
   description = "Number of OCPUs for the instance (if using Flex shape)."
   type        = number
-  default     = 4
+  default     = 2
 }
 
 variable "instanceMemory" {
   description = "Memory in GB for the instance (if using Flex shape)."
   type        = number
-  default     = 4
+  default     = 8
 }
 
 variable "bucketName" {
