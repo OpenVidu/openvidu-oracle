@@ -1,5 +1,5 @@
 # Stage 1: install Python dependencies and trim what we don't ship.
-FROM fnproject/python:3.11-dev AS build-stage
+FROM fnproject/python:3.12-dev AS build-stage
 WORKDIR /function
 
 ENV PIP_NO_CACHE_DIR=1 \
@@ -29,7 +29,7 @@ RUN find /python/packages -type d -name __pycache__ -exec rm -rf {} + ; \
 ADD . /function/
 
 # Stage 2: lean runtime image.
-FROM fnproject/python:3.11
+FROM fnproject/python:3.12
 WORKDIR /function
 COPY --from=build-stage /python/packages /python/packages
 COPY --from=build-stage /function /function
