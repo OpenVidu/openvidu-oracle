@@ -29,7 +29,30 @@ RUN find /python/packages -type d -name __pycache__ -exec rm -rf {} + ; \
 ADD . /function/
 
 # Stage 2: lean runtime image.
-FROM fnproject/python:3.12
+FROM fnproject/python:3.12 AS runtime-base
+# Apply the Oracle Linux security updates published after the base image was
+# built. pip, setuptools and wheel only install packages, which happens in the
+# build stage, so they are removed from the runtime together with the
+# libraries they vendor.
+RUN microdnf upgrade -y && \
+    microdnf remove -y python3.12-pip python3.12-setuptools && \
+    microdnf clean all && \
+    rm -rf /usr/local/lib/python3.12/site-packages/pip \
+           /usr/local/lib/python3.12/site-packages/pip-*.dist-info \
+           /usr/local/lib/python3.12/site-packages/setuptools \
+           /usr/local/lib/python3.12/site-packages/setuptools-*.dist-info \
+           /usr/local/lib/python3.12/site-packages/pkg_resources \
+           /usr/local/lib/python3.12/site-packages/_distutils_hack \
+           /usr/local/lib/python3.12/site-packages/distutils-precedence.pth \
+           /usr/local/lib/python3.12/site-packages/wheel \
+           /usr/local/lib/python3.12/site-packages/wheel-*.dist-info \
+           /usr/local/bin/pip* /usr/local/bin/wheel
+
+# Single-layer runtime: the upgrade above would otherwise add a second copy of
+# every updated package on top of the base image layers.
+FROM scratch
+COPY --from=runtime-base / /
+ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 WORKDIR /function
 COPY --from=build-stage /python/packages /python/packages
 COPY --from=build-stage /function /function
