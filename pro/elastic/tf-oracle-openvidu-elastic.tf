@@ -824,7 +824,7 @@ locals {
   # all others (VM.Standard.E*, .Standard3/2, BM.Standard2...) are x86.
   is_arm_instance = startswith(var.masterNodeShape, "VM.Standard.A") || startswith(var.masterNodeShape, "BM.Standard.A")
   yq_arch         = local.is_arm_instance ? "arm64" : "amd64"
-  yq_sha256       = local.is_arm_instance ? "46583da045a14b8b369510d59c5754201a49c1ca887b0a9ddae2823e21fad177" : "7dd21fe96aac5ecccef949f4e4abecf9f9344dc3a853f5a2b4633c7a7afa7dda"
+  yq_sha256       = local.is_arm_instance ? "980de87c439acb5172707560dd137e9fe4a1628af5aaf6f33b293f04c71d4e9d" : "09a25baa0e136b8633949e03117fc82cb9e50d10910f988ef17a1305539ebce4"
 
   # Common OCI Vault helpers (retry, query sanitization, read/write logic),
   # sourced by store_secret / update_config_from_secret / update_secret_from_config.
@@ -1720,7 +1720,7 @@ set -e
 
 OPENVIDU_VERSION=main
 DOMAIN=
-YQ_VERSION=v4.54.2
+YQ_VERSION=v4.54.3
 echo "DPkg::Lock::Timeout \"-1\";" > /etc/apt/apt.conf.d/99timeout
 
 # Bounded retry around transient apt bootstrap (flaky mirror/throttling).
