@@ -2986,7 +2986,7 @@ CONFIG_S3_EOF
 
   # Install OCI CLI via pipx (correct method on modern Ubuntu)
   export HOME="/root"
-  OCI_CLI_VERSION="3.96.0"
+  OCI_CLI_VERSION="3.96.2"
   # FIX-OR-1: bounded retry around transient pipx/PyPI install (throttled index).
   # Idempotent; exits non-zero after 5 failed attempts (set -e surfaces it).
   for i in 1 2 3 4 5; do
@@ -3323,7 +3323,7 @@ apt-get update && apt-get install -y \
 
 # Install OCI CLI via pipx — required by install script and pre-drain daemon
 export HOME="/root"
-OCI_CLI_VERSION="3.96.0"
+OCI_CLI_VERSION="3.96.2"
 pipx install oci-cli==$${OCI_CLI_VERSION} || ov_media_bootstrap_failed "pipx install oci-cli failed"
 export PATH="$PATH:$HOME/.local/bin"
 

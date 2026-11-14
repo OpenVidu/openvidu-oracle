@@ -2510,7 +2510,7 @@ CONFIG_S3_EOF
 
   # Install OCI CLI via pipx (correct method on modern Ubuntu)
   export HOME="/root"
-  OCI_CLI_VERSION="3.96.0"
+  OCI_CLI_VERSION="3.96.2"
   # Bounded retry around transient pipx/PyPI install (throttled index).
   for i in 1 2 3 4 5; do
     pipx install oci-cli==$${OCI_CLI_VERSION} && break
@@ -2800,7 +2800,7 @@ done
 
 # Install OCI CLI via pipx — needed by install script and pre-drain daemon
 export HOME="/root"
-OCI_CLI_VERSION="3.96.0"
+OCI_CLI_VERSION="3.96.2"
 # Bounded retry around transient pipx/PyPI install (throttled index).
 for i in 1 2 3 4 5; do
   pipx install oci-cli==$${OCI_CLI_VERSION} && break
