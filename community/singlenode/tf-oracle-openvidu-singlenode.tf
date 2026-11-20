@@ -1273,7 +1273,7 @@ CONFIG_S3_EOF
     firewalld
 
   # Install OCI CLI via pipx (required on modern Ubuntu)
-  OCI_CLI_VERSION="3.96.2"
+  OCI_CLI_VERSION="3.96.3"
   pipx install oci-cli==$${OCI_CLI_VERSION}
 
   # Add pipx bin dir to PATH so 'oci' is found
