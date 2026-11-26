@@ -756,7 +756,7 @@ EOF
 #!/bin/bash -x
 set -e
 
-OPENVIDU_VERSION=3.10.0
+OPENVIDU_VERSION=main
 DOMAIN=
 
 # Apply firewall rules
